@@ -1,4 +1,5 @@
 
+
 <h1 align="center">TrackVision: A Modular Open-Source Platform for Real-Time Spine Surgical Navigation</h1>
 
 
@@ -30,9 +31,9 @@ Minimally Invasive Spine Surgery (MISS) procedures — pedicle screw placement, 
 **Intraoperative Hardware Configuration**
 The Atracsys FusionTrack 500 optical camera simultaneously tracks three passive retro-reflective IR marker sets — the C-arm-mounted calibration drum, the surgical instrument tooltip, and the patient reference marker (PRM). The instrument-to-patient spatial relationship is derived online from these live 6-DOF streams.
 
-<!-- Architecture Image 2 -->
+
 <p align="center">
-  <img src="path/to/architecture_2d2d_pipeline.png" alt="2D-2D Transform Composition Pipeline" width="700"/>
+  <img width="1600" height="1146" alt="WhatsApp Image 2026-07-15 at 1 38 03 PM" src="https://github.com/user-attachments/assets/76e819be-ff6e-41d0-aaa2-42bc4c397fec" />
 </p>
 
 **2D–2D Transform Composition Pipeline**
@@ -40,7 +41,8 @@ Live tool and PRM transforms compose to yield the tooltip-to-PRM transform, whic
 
 <!-- Architecture Image 3 -->
 <p align="center">
-  <img src="path/to/architecture_2d3d_pipeline.png" alt="2D-3D Transform Composition Pipeline" width="700"/>
+  <img width="1600" height="1171" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM" src="https://github.com/user-attachments/assets/4e08bbab-1041-4b10-afc3-bc0dd545600d" />
+
 </p>
 
 **2D–3D Transform Composition Pipeline**
@@ -50,45 +52,34 @@ The live instrument tooltip is mapped into the CT volume frame via a static, pre
 
 ## Results
 
-<!-- Results Image 1 -->
 <p align="center">
-  <img src="path/to/results_tool_centric.png" alt="Tool-Centric Viewing Mode" width="700"/>
+  <img width="1518" height="1036" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM (1)" src="https://github.com/user-attachments/assets/66a772ce-c30d-4e2c-bff3-1a19ac91b6c5" />
+</p>
+
+<p align="center">
+<img width="1600" height="1104" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM" src="https://github.com/user-attachments/assets/e6ed9e15-1caa-4570-a528-40a67c388a60" />
+</p>
+
+<p align="center">
+<img width="1448" height="1086" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM (1)" src="https://github.com/user-attachments/assets/c6fba5a2-1a19-4fde-b7de-203d0c04182c" />
+</p>
+
+<p align="center">
+<img width="1600" height="916" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM" src="https://github.com/user-attachments/assets/b3c5fde9-7cd4-4ee9-a92b-dbd782dc3a3c" />
 </p>
 
 **Tool-Centric Mode**
 CT slice plane is centred on and oriented along the instrument axis, showing a cross-section of the anatomy exactly at the tooltip location and trajectory angle, validated across insertion angles of 25°, 50°, 75°, and 90°.
 
-<!-- Results Image 2 -->
-<p align="center">
-  <img src="path/to/results_scan_centric.png" alt="Scan-Centric Viewing Mode" width="700"/>
-</p>
-
 **Scan-Centric Mode**
 CT slice plane retains the standard anatomical orientation (axial, coronal, or sagittal) while translating to follow the instrument tooltip position, preserving anatomical context as the instrument advances.
-
-<!-- Results Image 3 -->
-<p align="center">
-  <img src="path/to/results_tool_dynamic.png" alt="Tool-Dynamic Viewing Mode" width="700"/>
-</p>
 
 **Tool-Dynamic Mode**
 CT slice plane both translates with the instrument tooltip and rotates to remain perpendicular to the instrument axis, offering continuous cross-sectional guidance throughout instrument advancement.
 
-<!-- Results Image 4 -->
-<p align="center">
-  <img src="path/to/results_navigation_panel.png" alt="2D-2D and 2D-3D Navigation Panels" width="700"/>
-</p>
-
-**Navigation Panels**
-Session controls for loading X-ray images, projection matrices, and instrument transforms, alongside the 2D–3D CT navigation panel showing axial, coronal, and sagittal slice views driven by the live tooltip-to-CT transform.
-
-<!-- Results Image 5 -->
 <p align="center">
   <img src="path/to/results_phantom_validation.png" alt="Phantom Validation Setup" width="700"/>
 </p>
-
-**Phantom Validation**
-Experimental setup with an L1–L5 lumbar spine phantom and optical camera at 2.6 m working distance, used to validate tracking performance across both 2D–2D and 2D–3D navigation modalities.
 
 ### Comparative Performance Analysis
 
