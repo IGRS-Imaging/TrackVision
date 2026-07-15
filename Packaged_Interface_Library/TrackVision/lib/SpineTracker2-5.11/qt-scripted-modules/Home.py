@@ -1,0 +1,12246 @@
+from __future__ import annotations
+import atexit
+import csv
+import ctypes
+import datetime
+import importlib
+import logging
+import logging.handlers
+import math
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from typing import Callable, Optional
+import numpy as np
+import ctk
+import qt
+import vtk
+import slicer
+import SlicerCustomAppUtilities
+from slicer.ScriptedLoadableModule import (
+    ScriptedLoadableModule,
+    ScriptedLoadableModuleLogic,
+    ScriptedLoadableModuleWidget,
+)
+from slicer.util import VTKObservationMixin
+
+# Import to ensure the files are available through the Qt resource system
+from Resources import HomeResources  # noqa: F401
+
+_SETTINGS_PREFIX = "SpineTracker2/Home/"
+_FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+_LIVE_POINTER_TO_TRACKER_NAME = "PointerToTracker"
+_LIVE_REFERENCE_TO_TRACKER_NAME = "ReferenceToTracker"
+_LIVE_PHANTOM_TO_TRACKER_NAME = "PhantomToTracker"
+_TRACKER_TO_REFERENCE_NAME = "TrackerToReference"
+_POINTER_TO_REFERENCE_NAME = "PointerToReference"
+_DEFAULT_REFERENCE_TO_CT_NAME = "ReferenceToCT"
+_DEFAULT_POINTER_TO_PHANTOM_NAME = "PointerToPhantom"
+_DEFAULT_POINTER_TO_CT_NAME = "PointerToCT"
+_NEEDLE_MODEL_TO_POINTER_CORRECTION_NAME = "NeedleModelToPointerCorrection"
+_NEEDLE_MODEL_TO_POINTER_CORRECTION_MATRIX = (
+    (0.0, 1.0, 0.0, 0.0),
+    (-1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+# Single hardware-alignment correction that maps the pointer's local frame
+# onto the physical tool-forward axis (its Z column becomes the tool's
+# forward direction in phantom space). Used by 2D-2D projection for both
+# AP and LP views — only the projection matrix P differs between views.
+_POINTER_TO_TOOL_CORRECTION = (
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (-1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+_DEFAULT_WINDOW_VALUE = 2687
+_DEFAULT_LEVEL_VALUE = 40
+_DEFAULT_VR_SHIFT_RANGE_HU = 2000
+# Tracking jitter smoothing. Strength is a fraction in [0, 1]: 0 disables
+# smoothing (raw pose passes through), higher values damp tracker jitter more
+# heavily at the cost of a little extra latency. The default keeps the tool
+# steady without feeling laggy.
+_DEFAULT_SMOOTHING_STRENGTH = 0.6
+_MAX_SMOOTHING_STRENGTH = 0.95
+_DEFAULT_REGISTRATION_RESOURCE_NAMES = ("registration_tracking.xml", "Registration_Tracking.xml")
+_ATRACSYS_RUNTIME_COMPANION_FILES = (
+    "atnetExecutable64.exe",
+    "atnetLib64.dll",
+    "AtracsysDataExchange64.exe",
+    "AtracsysDataExchangeLib64.dll",
+    "calibrationClient64.dll",
+    "capi.dll",
+    "dump2cams64.dll",
+    "fileSignature64.dll",
+    "libcrypto-1_1-x64.dll",
+    "libssl-1_1-x64.dll",
+    "Logger.exe",
+    "opencv_world450.dll",
+    "padlock.dll",
+    "quazip1-qt5.dll",
+    "validateCalib64.exe",
+    "zlib.dll",
+)
+_VRD_MODE_AXIAL = 1
+_VRD_MODE_SAGITTAL = 2
+_VRD_MODE_CORONAL = 3
+_VRD_MODE_INPLANE = 4
+_VRD_MODE_INPLANE90 = 5
+_VRD_MODE_TRANSVERSE = 6
+_YELLOW_SLICE_LAYOUT_COLOR = (79.0 / 255.0, 134.0 / 255.0, 1.0)
+_SCAN_CENTRIC_SLICE_ZOOM_FACTOR = 0.55
+# Upper bound for the in-plane field of view in scan-centric mode. The zoom
+# factor alone is relative to the scan extent, so on large scans the views
+# stayed too zoomed-out and the tool looked tiny. Clamping to a physical size
+# keeps the tool a consistent, usable size regardless of CT dimensions.
+_SCAN_CENTRIC_MAX_FOV_MM = 160.0
+_TRACKING_MODE_BUTTON_SELECTED_STYLE = (
+    "background: #4f86ff;"
+    "border: 2px solid #4f86ff;"
+    "border-radius: 14px;"
+    "color: #000000;"
+    "font-weight: 700;"
+    "min-height: 34px;"
+)
+_TRACKING_MODE_BUTTON_UNSELECTED_STYLE = (
+    "background: #000000;"
+    "border: 1px solid #4f86ff;"
+    "border-radius: 14px;"
+    "color: #ffffff;"
+    "font-weight: 700;"
+    "min-height: 34px;"
+)
+_REGISTRATION_METHOD_ATTRIBUTE = "SpineTracker2.RegistrationMethod"
+_REGISTRATION_SOURCE_ATTRIBUTE = "SpineTracker2.RegistrationSource"
+_REGISTRATION_RMSE_ATTRIBUTE = "SpineTracker2.RegistrationRMSE"
+_LEGACY_REFERENCE_TO_CT_NAMES = {"", "CTToReference", "CTToTracker", "CTToPhantom"}
+_LEGACY_POINTER_TO_CT_NAMES = {
+    "",
+    "NeedleToReference",
+    "NeedleToTracker",
+    "NeedleToPhantom",
+    "PointerToTracker",
+    "PointerToPhantom",
+}
+
+
+@dataclass(frozen=True)
+class WorkflowParams:
+    dicom_folder: str
+    needle_stl_path: str
+    plus_config_path: str
+    registration_matrix_path: str
+    launcher_host: str
+    launcher_port: int
+    invert_registration_matrix: bool = True
+    ct_transform_name: str = _DEFAULT_REFERENCE_TO_CT_NAME
+    needle_transform_name: str = _DEFAULT_POINTER_TO_CT_NAME
+    plus_exe_path: str = ""
+    phantom_geometry_path: str = ""
+    tool_geometry_path: str = ""
+    plus_mode: str = "internal"
+
+
+def _generate_plus_config(template_path: str, phantom_ini: str, tool_ini: str, output_dir: str, igtl_port: int = 18944) -> str:
+    """Generate a PlusServer config XML from template, copying geometry files alongside it.
+
+    Uses absolute forward-slash paths for GeometryFile so the result is
+    self-contained and does not depend on PlusServer's
+    DeviceSetConfigurationDirectory (which may be hardcoded to a
+    developer-only path in the shipped PlusConfig.xml).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    phantom_dest = os.path.join(output_dir, os.path.basename(phantom_ini))
+    tool_dest = os.path.join(output_dir, os.path.basename(tool_ini))
+    shutil.copy2(phantom_ini, phantom_dest)
+    shutil.copy2(tool_ini, tool_dest)
+    phantom_ref = phantom_dest.replace(os.sep, "/")
+    tool_ref = tool_dest.replace(os.sep, "/")
+    tree = ET.parse(template_path)
+    root = tree.getroot()
+    for ds in root.iter("DataSource"):
+        ds_id = ds.get("Id", "")
+        if ds_id == "Phantom":
+            ds.set("GeometryFile", phantom_ref)
+        elif ds_id == "Pointer":
+            ds.set("GeometryFile", tool_ref)
+    for server_elem in root.iter("PlusOpenIGTLinkServer"):
+        server_elem.set("ListeningPort", str(igtl_port))
+    output_xml = os.path.join(output_dir, "Registration_Tracking.xml")
+    tree.write(output_xml, encoding="unicode", xml_declaration=False)
+    _module_logger.info(
+        "Generated PlusServer config: %s (phantom=%s exists=%s, tool=%s exists=%s)",
+        output_xml, phantom_ref, os.path.isfile(phantom_dest),
+        tool_ref, os.path.isfile(tool_dest),
+    )
+    return output_xml
+
+
+def _wait_for_port(host: str, port: int, timeout_s: float = 15.0) -> bool:
+    """Block until a TCP port is accepting connections, or timeout."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+def _deduplicate_paths(paths, *, require_existing: bool = False):
+    unique_paths = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.normpath(path))
+        if normalized in seen:
+            continue
+        if require_existing and not os.path.isdir(path):
+            continue
+        seen.add(normalized)
+        unique_paths.append(os.path.normpath(path))
+    return unique_paths
+
+
+def _candidate_atracsys_sdk_bin_dirs():
+    candidates = []
+    for env_name in (
+        "ATRACSYS_SDK_BIN",
+        "ATRACSYS_FUSIONTRACK_SDK_BIN",
+        "ATRACSYS_SDK_DIR",
+        "FUSIONTRACK_SDK_DIR",
+    ):
+        raw_path = os.environ.get(env_name, "").strip()
+        if not raw_path:
+            continue
+        candidates.append(raw_path)
+        candidates.append(os.path.join(raw_path, "bin"))
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base_path = os.environ.get(env_name, "").strip()
+        if not base_path:
+            continue
+        candidates.append(os.path.join(base_path, "Atracsys", "fusionTrack SDK x64", "bin"))
+        candidates.append(os.path.join(base_path, "Atracsys", "fusionTrack SDK", "bin"))
+    return _deduplicate_paths(candidates, require_existing=True)
+
+
+def _resolve_atracsys_runtime_dirs(plusserver_dir: str):
+    """Find Atracsys SDK runtime directories to supplement the bundled PlusServer."""
+    if not plusserver_dir or not os.path.isdir(plusserver_dir):
+        return [], list(_ATRACSYS_RUNTIME_COMPANION_FILES), list(_ATRACSYS_RUNTIME_COMPANION_FILES)
+
+    bundle_missing = [
+        name for name in _ATRACSYS_RUNTIME_COMPANION_FILES
+        if not os.path.isfile(os.path.join(plusserver_dir, name))
+    ]
+    unresolved = list(bundle_missing)
+    runtime_dirs = []
+    for candidate_dir in _candidate_atracsys_sdk_bin_dirs():
+        provided = [
+            name for name in unresolved
+            if os.path.isfile(os.path.join(candidate_dir, name))
+        ]
+        if not provided:
+            continue
+        runtime_dirs.append(candidate_dir)
+        unresolved = [name for name in unresolved if name not in provided]
+        if not unresolved:
+            break
+    return runtime_dirs, bundle_missing, unresolved
+
+
+def _build_subprocess_env(extra_lookup_dirs):
+    env = os.environ.copy()
+    extra_dirs = _deduplicate_paths(extra_lookup_dirs, require_existing=True)
+    if not extra_dirs:
+        return env
+    existing_path = env.get("PATH", "")
+    env["PATH"] = os.pathsep.join(extra_dirs + ([existing_path] if existing_path else []))
+    return env
+
+
+@dataclass
+class TrackingInputSelection:
+    reference_frame_name: str = "Reference"
+    reference_to_tracker_node: Optional[object] = None
+    pointer_to_tracker_node: Optional[object] = None
+    pointer_to_reference_node: Optional[object] = None
+    reference_to_pointer_node: Optional[object] = None
+
+
+def _configure_module_logging():
+    """Set up bounded, non-blocking logging with rotation and auto-cleanup."""
+    logger = logging.getLogger(__name__)
+    if getattr(logger, "_spinetracker_configured", False):
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = True
+
+    # Rotating file handler: 2 MB max, keep 3 backups, auto-deletes oldest
+    try:
+        if hasattr(slicer, "app"):
+            log_dir = os.path.join(slicer.app.temporaryPath, "SpineTracker2_logs")
+        else:
+            log_dir = os.path.join(tempfile.gettempdir(), "SpineTracker2_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "spinetracker2.log")
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(file_handler)
+    except Exception:
+        pass
+
+    # Auto-delete stale SpineTracker temp folders older than 7 days
+    try:
+        temp_root = tempfile.gettempdir()
+        cutoff = time.time() - 7 * 86400
+        for entry in os.listdir(temp_root):
+            if entry.startswith("SpineTracker_"):
+                full = os.path.join(temp_root, entry)
+                if os.path.isdir(full) and os.path.getmtime(full) < cutoff:
+                    shutil.rmtree(full, ignore_errors=True)
+    except Exception:
+        pass
+
+    logger._spinetracker_configured = True
+    return logger
+
+
+_module_logger = _configure_module_logging()
+
+
+# Windows Job Object — when the Slicer process dies (any reason, including
+# Task Manager kill or hard crash), all processes assigned to this Job are
+# force-killed by the OS. This is the bulletproof way to prevent PlusServer
+# from being left as an orphan process.
+_PLUS_JOB_HANDLE = None
+
+
+def _get_or_create_plus_job_handle():
+    """Return a Windows Job Object handle configured to kill all assigned
+    processes when the handle closes (i.e. when Slicer exits). Creates it
+    lazily on first use. Returns None on non-Windows or if unsupported."""
+    global _PLUS_JOB_HANDLE
+    if _PLUS_JOB_HANDLE is not None:
+        return _PLUS_JOB_HANDLE
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        CreateJobObjectW = kernel32.CreateJobObjectW
+        CreateJobObjectW.restype = ctypes.c_void_p
+        CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+
+        SetInformationJobObject = kernel32.SetInformationJobObject
+        SetInformationJobObject.restype = ctypes.c_int
+        SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint
+        ]
+
+        handle = CreateJobObjectW(None, None)
+        if not handle:
+            return None
+
+        # JOBOBJECT_EXTENDED_LIMIT_INFORMATION structure (relevant fields only)
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_void_p),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        ok = SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            return None
+
+        _PLUS_JOB_HANDLE = handle
+        return handle
+    except Exception:
+        return None
+
+
+def _assign_process_to_plus_job(pid: int) -> bool:
+    """Assign a Windows process by PID to the kill-on-close Job Object.
+    Returns True on success. No-op / False on non-Windows or failure."""
+    if not sys.platform.startswith("win"):
+        return False
+    job = _get_or_create_plus_job_handle()
+    if not job:
+        return False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_ALL_ACCESS = 0x1F0FFF
+        OpenProcess = kernel32.OpenProcess
+        OpenProcess.restype = ctypes.c_void_p
+        OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+
+        AssignProcessToJobObject = kernel32.AssignProcessToJobObject
+        AssignProcessToJobObject.restype = ctypes.c_int
+        AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.restype = ctypes.c_int
+        CloseHandle.argtypes = [ctypes.c_void_p]
+
+        proc_handle = OpenProcess(PROCESS_ALL_ACCESS, 0, int(pid))
+        if not proc_handle:
+            return False
+        try:
+            ok = AssignProcessToJobObject(job, proc_handle)
+            return bool(ok)
+        finally:
+            CloseHandle(proc_handle)
+    except Exception:
+        return False
+
+
+class _StatusState:
+    OK = "ok"
+    WAIT = "wait"
+    FAIL = "fail"
+    ERR = "err"
+
+
+def _normalize_tracking_view_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized in ("scan", "scan_centric", "scancentric"):
+        return "scan_centric"
+    if normalized in ("dynamic", "tooldynamic", "tool_dynamic", "tool dynamic"):
+        return "tool_dynamic"
+    return "tool_centric"
+
+
+def _slice_driver_mode_map_for_tracking_view_mode(mode: str) -> tuple[tuple[str, int], ...]:
+    normalized = _normalize_tracking_view_mode(mode)
+    if normalized == "scan_centric":
+        return (
+            ("Red", _VRD_MODE_AXIAL),
+            ("Yellow", _VRD_MODE_SAGITTAL),
+            ("Green", _VRD_MODE_CORONAL),
+        )
+    return (
+        ("Red", _VRD_MODE_INPLANE),
+        ("Yellow", _VRD_MODE_INPLANE90),
+        ("Green", _VRD_MODE_TRANSVERSE),
+    )
+
+
+def _ensure_intersecting_slices_visible():
+    try:
+        app_logic = slicer.app.applicationLogic()
+    except Exception:
+        app_logic = None
+    if app_logic is not None:
+        try:
+            app_logic.SetIntersectingSlicesEnabled(
+                slicer.vtkMRMLApplicationLogic.IntersectingSlicesVisibility,
+                True,
+            )
+        except Exception:
+            pass
+
+    try:
+        layout_manager = slicer.app.layoutManager()
+    except Exception:
+        layout_manager = None
+    if layout_manager is None:
+        return
+
+    try:
+        slice_view_names = list(layout_manager.sliceViewNames())
+    except Exception:
+        slice_view_names = ("Red", "Yellow", "Green")
+
+    for view_name in slice_view_names:
+        try:
+            slice_widget = layout_manager.sliceWidget(view_name)
+            if slice_widget is None:
+                continue
+            slice_node = slice_widget.mrmlSliceNode() if hasattr(slice_widget, "mrmlSliceNode") else None
+            _apply_custom_slice_layout_color(slice_node)
+            slice_logic = slice_widget.sliceLogic() if hasattr(slice_widget, "sliceLogic") else None
+            slice_display_node = slice_logic.GetSliceDisplayNode() if slice_logic is not None else None
+            if slice_display_node is not None:
+                slice_display_node.SetIntersectingSlicesVisibility(True)
+        except Exception:
+            continue
+
+
+def _apply_custom_slice_layout_color(slice_node):
+    if slice_node is None:
+        return
+    try:
+        layout_name = str(slice_node.GetLayoutName() or "")
+    except Exception:
+        layout_name = ""
+    if not layout_name.lower().startswith("yellow"):
+        return
+    try:
+        slice_node.SetLayoutColor(*_YELLOW_SLICE_LAYOUT_COLOR)
+    except Exception:
+        pass
+
+
+def _slice_node_field_of_view(slice_node) -> Optional[tuple[float, float, float]]:
+    if slice_node is None:
+        return None
+    try:
+        fov = slice_node.GetFieldOfView()
+    except Exception:
+        fov = None
+    if fov is None:
+        return None
+    try:
+        return (float(fov[0]), float(fov[1]), float(fov[2]))
+    except Exception:
+        return None
+
+
+def _set_slice_node_field_of_view(slice_node, fov_xyz: tuple[float, float, float]):
+    if slice_node is None:
+        return
+    try:
+        slice_node.SetFieldOfView(float(fov_xyz[0]), float(fov_xyz[1]), float(fov_xyz[2]))
+    except Exception:
+        return
+    try:
+        slice_node.UpdateMatrices()
+    except Exception:
+        pass
+
+
+def _scan_centric_zoomed_fov(base_fov: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Compute the zoomed in-plane FOV for scan-centric tracking views.
+
+    Zooms proportionally to the fitted scan extent, but never leaves the
+    in-plane field of view wider than _SCAN_CENTRIC_MAX_FOV_MM so the tracked
+    tool stays a usable on-screen size even for large scans. A single scale is
+    applied to both in-plane axes (aspect preserved); the through-plane extent
+    is left unchanged.
+    """
+    width = float(base_fov[0])
+    height = float(base_fov[1])
+    scale = _SCAN_CENTRIC_SLICE_ZOOM_FACTOR
+    largest = max(width, height)
+    if largest > 1e-6:
+        scale = min(scale, _SCAN_CENTRIC_MAX_FOV_MM / largest)
+    return (width * scale, height * scale, float(base_fov[2]))
+
+
+def _smoothing_strength_to_alpha(strength: float) -> float:
+    """Map a user-facing smoothing strength in [0, 1] to an EMA blend factor.
+
+    ``alpha`` is the weight given to each fresh sample. ``alpha == 1`` means no
+    smoothing (output follows input exactly); smaller ``alpha`` means heavier
+    smoothing. Strength is clamped to ``_MAX_SMOOTHING_STRENGTH`` so the output
+    can never fully freeze (which would ignore real motion).
+    """
+    try:
+        value = float(strength)
+    except (TypeError, ValueError):
+        return 1.0
+    if value != value:  # NaN
+        return 1.0
+    value = min(_MAX_SMOOTHING_STRENGTH, max(0.0, value))
+    return 1.0 - value
+
+
+class _PoseStabilizer:
+    """Temporal low-pass filter for a rigid-body pose (a 4x4 transform).
+
+    Tracker streams (optical/EM) carry high-frequency noise that makes the
+    displayed tool/needle and the reslice-driven slices visibly shake even when
+    the physical tool is still. This filter smooths the translation with an
+    exponential moving average and the rotation with quaternion SLERP, so the
+    on-screen pose stays steady. Heavier smoothing adds a little latency, so the
+    strength is tunable.
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        self._alpha = self._clamp_alpha(alpha)
+        self._have_state = False
+        self._translation = np.zeros(3)
+        self._quaternion = np.array([1.0, 0.0, 0.0, 0.0])  # w, x, y, z
+
+    @staticmethod
+    def _clamp_alpha(alpha: float) -> float:
+        try:
+            value = float(alpha)
+        except (TypeError, ValueError):
+            return 1.0
+        if value != value:  # NaN
+            return 1.0
+        return min(1.0, max(0.0, value))
+
+    def set_alpha(self, alpha: float):
+        self._alpha = self._clamp_alpha(alpha)
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    def reset(self):
+        """Forget the running state so the next sample is taken as-is.
+
+        Call this whenever the input pose can jump discontinuously (tracking
+        (re)start, switching reference frames) to avoid interpolating across the
+        discontinuity.
+        """
+        self._have_state = False
+
+    def is_enabled(self) -> bool:
+        return self._alpha < 1.0
+
+    def smooth_matrix(self, matrix: "vtk.vtkMatrix4x4") -> "vtk.vtkMatrix4x4":
+        """Return a smoothed copy of ``matrix`` (or ``matrix`` unchanged).
+
+        Falls back to passthrough when smoothing is disabled or the matrix is
+        not a clean rigid transform (e.g. degenerate/scaled), so a bad frame can
+        never corrupt the running state.
+        """
+        if matrix is None or not self.is_enabled():
+            return matrix
+        translation, quaternion = self._decompose(matrix)
+        if quaternion is None:
+            return matrix
+        if not self._have_state:
+            self._translation = translation
+            self._quaternion = quaternion
+            self._have_state = True
+            return matrix
+        a = self._alpha
+        self._translation = a * translation + (1.0 - a) * self._translation
+        self._quaternion = self._slerp(self._quaternion, quaternion, a)
+        return self._compose(self._translation, self._quaternion)
+
+    @staticmethod
+    def _decompose(matrix):
+        rotation = np.empty((3, 3))
+        translation = np.empty(3)
+        for r in range(3):
+            translation[r] = matrix.GetElement(r, 3)
+            for c in range(3):
+                rotation[r, c] = matrix.GetElement(r, c)
+        det = np.linalg.det(rotation)
+        if not np.isfinite(det) or det <= 1e-6:
+            return translation, None
+        return translation, _PoseStabilizer._matrix_to_quaternion(rotation)
+
+    @staticmethod
+    def _matrix_to_quaternion(R):
+        trace = R[0, 0] + R[1, 1] + R[2, 2]
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            w = 0.25 * s
+            x = (R[2, 1] - R[1, 2]) / s
+            y = (R[0, 2] - R[2, 0]) / s
+            z = (R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+        q = np.array([w, x, y, z])
+        norm = np.linalg.norm(q)
+        if norm < 1e-12:
+            return np.array([1.0, 0.0, 0.0, 0.0])
+        return q / norm
+
+    @staticmethod
+    def _quaternion_to_matrix(q):
+        w, x, y, z = q
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ])
+
+    @staticmethod
+    def _slerp(q_prev, q_new, t):
+        dot = float(np.dot(q_prev, q_new))
+        if dot < 0.0:  # take the shorter arc
+            q_new = -q_new
+            dot = -dot
+        if dot > 0.9995:  # nearly identical; linear blend is safe and avoids div-by-zero
+            result = q_prev + t * (q_new - q_prev)
+        else:
+            theta_0 = math.acos(max(-1.0, min(1.0, dot)))
+            sin_0 = math.sin(theta_0)
+            theta = theta_0 * t
+            s_prev = math.sin(theta_0 - theta) / sin_0
+            s_new = math.sin(theta) / sin_0
+            result = s_prev * q_prev + s_new * q_new
+        norm = np.linalg.norm(result)
+        if norm < 1e-12:
+            return q_new
+        return result / norm
+
+    def _compose(self, translation, quaternion):
+        R = self._quaternion_to_matrix(quaternion)
+        out = vtk.vtkMatrix4x4()
+        for r in range(3):
+            for c in range(3):
+                out.SetElement(r, c, float(R[r, c]))
+            out.SetElement(r, 3, float(translation[r]))
+        for c in range(3):
+            out.SetElement(3, c, 0.0)
+        out.SetElement(3, 3, 1.0)
+        return out
+
+
+class _AutomaticPointerToCtChain:
+    """Maintains PointerToPhantom and PointerToCT continuously from the live stream."""
+
+    def __init__(self, log: Optional[logging.Logger] = None):
+        self._log = log or logging.getLogger(__name__)
+        self._timer = qt.QTimer()
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh)
+
+        self._scene_observers: list[tuple[object, int]] = []
+        self._input_observers: list[tuple[object, int]] = []
+
+        self._pointer_to_tracker_node = None
+        self._phantom_to_tracker_node = None
+        self._reference_to_ct_node = None
+        self._pointer_to_phantom_node = None
+        self._pointer_to_ct_node = None
+        self._loaded_registration_path: str = ""
+        self._loaded_registration_mtime: float = -1.0
+        self._loaded_registration_target_node_id: str = ""
+        self._registration_missing_reported: bool = False
+        self._registration_invalid_signature: str = ""
+        self._registration_identity_signature: str = ""
+        self._stabilizer = _PoseStabilizer(_smoothing_strength_to_alpha(_DEFAULT_SMOOTHING_STRENGTH))
+
+    def set_smoothing_strength(self, strength: float):
+        """Set tracking jitter smoothing strength (0 = off, higher = steadier)."""
+        self._stabilizer.set_alpha(_smoothing_strength_to_alpha(strength))
+        self._stabilizer.reset()
+
+    def is_actively_tracking(self) -> bool:
+        """True when this chain is running and has every input it needs to
+        derive PointerToCT itself — used by the workflow pipeline to avoid
+        double-writing (and double-smoothing) the same output node."""
+        try:
+            running = self._timer is not None and self._timer.isActive()
+        except Exception:
+            running = False
+        return bool(
+            running
+            and self._pointer_to_tracker_node is not None
+            and self._phantom_to_tracker_node is not None
+            and self._reference_to_ct_node is not None
+            and self._pointer_to_ct_node is not None
+        )
+
+    def start(self):
+        self._observe_scene()
+        if self._timer is None:
+            self._timer = qt.QTimer()
+            self._timer.setInterval(1000)
+            self._timer.timeout.connect(self._refresh)
+        if not self._timer.isActive():
+            self._timer.start()
+        self._refresh()
+
+    def stop(self):
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer.deleteLater()
+            self._timer = None
+        self._remove_input_observers()
+        self._remove_scene_observers()
+
+    def _observe_scene(self):
+        if self._scene_observers or slicer.mrmlScene is None:
+            return
+        for event_id in (
+            slicer.mrmlScene.NodeAddedEvent,
+            slicer.mrmlScene.NodeRemovedEvent,
+            slicer.mrmlScene.EndImportEvent,
+            slicer.mrmlScene.EndCloseEvent,
+        ):
+            try:
+                tag = slicer.mrmlScene.AddObserver(event_id, self._on_scene_changed)
+            except Exception:
+                continue
+            self._scene_observers.append((slicer.mrmlScene, tag))
+
+    def _remove_scene_observers(self):
+        while self._scene_observers:
+            node, tag = self._scene_observers.pop()
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+
+    def _remove_input_observers(self):
+        while self._input_observers:
+            node, tag = self._input_observers.pop()
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+
+    def _find_transform_node(self, name: str):
+        node = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", name)
+        if node is not None:
+            return node
+        for transform_node in slicer.util.getNodesByClass("vtkMRMLTransformNode"):
+            try:
+                if transform_node.GetName() == name:
+                    return transform_node
+            except Exception:
+                continue
+        return None
+
+    def _get_or_create_linear_transform(self, name: str):
+        node = self._find_transform_node(name)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        try:
+            node.SetAttribute("SpineTracker2.AutoCreated", "1")
+        except Exception:
+            pass
+        try:
+            node.SetHideFromEditors(False)
+        except Exception:
+            pass
+        return node
+
+    def _clear_parent_transform(self, node):
+        if node is None:
+            return
+        try:
+            if node.GetTransformNodeID():
+                node.SetAndObserveTransformNodeID(None)
+        except Exception:
+            pass
+
+    def _on_scene_changed(self, *_args):
+        qt.QTimer.singleShot(0, self._refresh)
+
+    def _on_input_modified(self, _caller=None, _event=None):
+        self._update_chain()
+
+    def _ensure_output_nodes(self):
+        if slicer.mrmlScene is None:
+            return
+        self._reference_to_ct_node = self._get_or_create_linear_transform(_DEFAULT_REFERENCE_TO_CT_NAME)
+        self._pointer_to_phantom_node = self._get_or_create_linear_transform(_DEFAULT_POINTER_TO_PHANTOM_NAME)
+        self._pointer_to_ct_node = self._get_or_create_linear_transform(_DEFAULT_POINTER_TO_CT_NAME)
+        self._clear_parent_transform(self._pointer_to_phantom_node)
+        self._clear_parent_transform(self._pointer_to_ct_node)
+
+    def _log_info(self, message: str):
+        try:
+            self._log.info(message)
+        except Exception:
+            pass
+
+    def _log_warning(self, message: str):
+        try:
+            self._log.warning(message)
+        except Exception:
+            pass
+
+    def _registration_candidate_paths(self) -> list[str]:
+        search_dirs: list[str] = []
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        search_dirs.append(os.path.join(module_dir, "Resources"))
+
+        try:
+            slicer_home = str(getattr(slicer.app, "slicerHome", "") or "").strip()
+        except Exception:
+            slicer_home = ""
+        if slicer_home:
+            search_dirs.append(os.path.join(os.path.abspath(os.path.join(slicer_home, os.pardir)), "Resources"))
+
+        candidate_paths: list[str] = []
+        seen_dirs: set[str] = set()
+        for search_dir in search_dirs:
+            normalized_dir = os.path.abspath(search_dir)
+            if normalized_dir in seen_dirs:
+                continue
+            seen_dirs.add(normalized_dir)
+            for filename in _DEFAULT_REGISTRATION_RESOURCE_NAMES:
+                candidate_path = os.path.abspath(os.path.join(normalized_dir, filename))
+                if candidate_path not in candidate_paths:
+                    candidate_paths.append(candidate_path)
+        return candidate_paths
+
+    def _matrix_is_identity(self, matrix: vtk.vtkMatrix4x4) -> bool:
+        for row in range(4):
+            for column in range(4):
+                expected = 1.0 if row == column else 0.0
+                if abs(matrix.GetElement(row, column) - expected) > 1e-6:
+                    return False
+        return True
+
+    def _matrix_from_values(self, values: list[float]) -> Optional[vtk.vtkMatrix4x4]:
+        if len(values) != 16:
+            return None
+        matrix = vtk.vtkMatrix4x4()
+        index = 0
+        for row in range(4):
+            for column in range(4):
+                matrix.SetElement(row, column, float(values[index]))
+                index += 1
+        return matrix
+
+    def _extract_matrix_from_xml(self, path: str) -> Optional[vtk.vtkMatrix4x4]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+        except Exception:
+            return None
+
+        try:
+            root = ET.fromstring(content)
+        except Exception:
+            return None
+
+        for elem in root.iter():
+            tag_name = str(elem.tag).split("}", 1)[-1].lower()
+            candidate_fields: list[tuple[str, str]] = []
+            if elem.text:
+                candidate_fields.append((tag_name, str(elem.text)))
+            for attr_name, attr_value in elem.attrib.items():
+                candidate_fields.append((str(attr_name).lower(), str(attr_value)))
+
+            for field_name, field_value in candidate_fields:
+                if not any(token in field_name for token in ("matrix", "transform", "referencetoct", "elements", "values")):
+                    continue
+                matches = _FLOAT_RE.findall(field_value)
+                if len(matches) != 16:
+                    continue
+                try:
+                    values = [float(match) for match in matches]
+                except ValueError:
+                    continue
+                matrix = self._matrix_from_values(values)
+                if matrix is not None:
+                    return matrix
+        return None
+
+    def _xml_root_tag_name(self, path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+        except Exception:
+            return ""
+        try:
+            root = ET.fromstring(content)
+        except Exception:
+            return ""
+        return str(root.tag).split("}", 1)[-1].lower()
+
+    def _read_plain_matrix_file(self, path: str) -> Optional[vtk.vtkMatrix4x4]:
+        values: list[float] = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+                for line in fp:
+                    stripped = line.strip()
+                    if not stripped or stripped.lstrip().startswith("#"):
+                        continue
+                    matches = _FLOAT_RE.findall(stripped)
+                    if matches:
+                        values.extend(float(match) for match in matches)
+        except Exception:
+            return None
+        return self._matrix_from_values(values)
+
+    def _remove_loaded_node_if_temporary(self, loaded_node):
+        if loaded_node is None:
+            return
+        if self._reference_to_ct_node is not None and loaded_node.GetID() == self._reference_to_ct_node.GetID():
+            return
+        storage_node = None
+        try:
+            storage_node = loaded_node.GetStorageNode()
+        except Exception:
+            storage_node = None
+        try:
+            slicer.mrmlScene.RemoveNode(loaded_node)
+        except Exception:
+            pass
+        if storage_node is not None:
+            try:
+                if storage_node.GetScene() is not None:
+                    slicer.mrmlScene.RemoveNode(storage_node)
+            except Exception:
+                pass
+
+    def _load_registration_matrix(self, path: str) -> tuple[Optional[vtk.vtkMatrix4x4], Optional[object], str]:
+        loaded_node = None
+        if path.lower().endswith(".xml"):
+            root_tag_name = self._xml_root_tag_name(path)
+            if root_tag_name == "plusconfiguration":
+                matrix = self._extract_matrix_from_xml(path)
+                if matrix is not None:
+                    return matrix, None, ""
+                return None, None, "file is a PLUS configuration, not a registration transform"
+
+        try:
+            try:
+                load_result = slicer.util.loadTransform(path, returnNode=True)
+            except TypeError:
+                # returnNode was removed in Slicer 5.x — the modern loader
+                # returns the node directly.
+                load_result = slicer.util.loadTransform(path)
+            if isinstance(load_result, tuple):
+                success, loaded = load_result
+            else:
+                success = load_result is not None
+                loaded = load_result
+            if success:
+                if isinstance(loaded, list):
+                    loaded_node = loaded[0] if loaded else None
+                else:
+                    loaded_node = loaded
+                if loaded_node is not None:
+                    matrix = vtk.vtkMatrix4x4()
+                    loaded_node.GetMatrixTransformToParent(matrix)
+                    return matrix, loaded_node, ""
+        except Exception as exc:
+            load_error = str(exc)
+        else:
+            load_error = ""
+
+        matrix = None
+        if path.lower().endswith(".xml"):
+            matrix = self._extract_matrix_from_xml(path)
+        if matrix is None:
+            matrix = self._read_plain_matrix_file(path)
+        if matrix is not None:
+            return matrix, None, ""
+        return None, loaded_node, load_error or "file is not a valid transform or 4x4 registration matrix"
+
+    def _attempt_registration_load(self):
+        if self._reference_to_ct_node is None:
+            return
+
+        candidate_path = ""
+        for path in self._registration_candidate_paths():
+            if os.path.exists(path):
+                candidate_path = path
+                break
+
+        if not candidate_path:
+            if not self._registration_missing_reported:
+                self._log_warning("SpineTracker2: registration_tracking.xml not found. Retrying in 1 second.")
+                self._registration_missing_reported = True
+            return
+
+        self._registration_missing_reported = False
+
+        try:
+            candidate_mtime = float(os.path.getmtime(candidate_path))
+        except OSError:
+            candidate_mtime = -1.0
+
+        invalid_signature = f"{candidate_path}|{candidate_mtime}"
+        if self._registration_invalid_signature == invalid_signature:
+            return
+
+        reference_node_id = self._reference_to_ct_node.GetID() or ""
+        already_loaded = (
+            self._loaded_registration_path == candidate_path
+            and abs(self._loaded_registration_mtime - candidate_mtime) < 1e-9
+            and self._loaded_registration_target_node_id == reference_node_id
+        )
+        if already_loaded:
+            return
+
+        matrix, loaded_node, error_message = self._load_registration_matrix(candidate_path)
+        if matrix is None:
+            if self._registration_invalid_signature != invalid_signature:
+                self._log_warning(
+                    f"SpineTracker2: could not load registration from '{candidate_path}': {error_message}"
+                )
+                self._registration_invalid_signature = invalid_signature
+            self._remove_loaded_node_if_temporary(loaded_node)
+            return
+
+        self._registration_invalid_signature = ""
+        # A new registration shifts PointerToCT discontinuously; drop the
+        # smoothing state so we don't slowly drift from the old pose.
+        self._stabilizer.reset()
+        self._clear_parent_transform(self._reference_to_ct_node)
+        self._reference_to_ct_node.SetName(_DEFAULT_REFERENCE_TO_CT_NAME)
+        self._reference_to_ct_node.SetMatrixTransformToParent(matrix)
+        try:
+            self._reference_to_ct_node.SetAttribute("SpineTracker2.AutoRegistrationPath", candidate_path)
+        except Exception:
+            pass
+        try:
+            self._reference_to_ct_node.SetAttribute(_REGISTRATION_METHOD_ATTRIBUTE, "matrix-file")
+            self._reference_to_ct_node.SetAttribute(
+                _REGISTRATION_SOURCE_ATTRIBUTE,
+                os.path.basename(candidate_path),
+            )
+            self._reference_to_ct_node.SetAttribute(_REGISTRATION_RMSE_ATTRIBUTE, "")
+        except Exception:
+            pass
+
+        self._loaded_registration_path = candidate_path
+        self._loaded_registration_mtime = candidate_mtime
+        self._loaded_registration_target_node_id = reference_node_id
+        self._remove_loaded_node_if_temporary(loaded_node)
+        self._log_info(f"SpineTracker2: ReferenceToCT loaded from file: {candidate_path}")
+
+        identity_signature = f"{candidate_path}|{candidate_mtime}"
+        if self._matrix_is_identity(matrix):
+            if self._registration_identity_signature != identity_signature:
+                self._log_warning(
+                    "SpineTracker2: warning: loaded ReferenceToCT is identity. Tracking will not be registered to CT."
+                )
+                self._registration_identity_signature = identity_signature
+        else:
+            self._registration_identity_signature = ""
+
+    def _refresh(self):
+        if slicer.mrmlScene is None:
+            return
+
+        # Capture BEFORE _ensure_output_nodes() refreshes it — comparing the
+        # post-refresh value against itself made ReferenceToCT replacement
+        # (scene close/reimport) never trigger re-observation, leaving the
+        # observer on the deleted node.
+        previous_reference_to_ct = self._reference_to_ct_node
+
+        self._ensure_output_nodes()
+        self._attempt_registration_load()
+
+        pointer_to_tracker = self._find_transform_node(_LIVE_POINTER_TO_TRACKER_NAME)
+        phantom_to_tracker = self._find_transform_node(_LIVE_PHANTOM_TO_TRACKER_NAME)
+        reference_to_ct = self._reference_to_ct_node
+
+        needs_reobserve = any(
+            current is not expected
+            for current, expected in (
+                (self._pointer_to_tracker_node, pointer_to_tracker),
+                (self._phantom_to_tracker_node, phantom_to_tracker),
+                (previous_reference_to_ct, reference_to_ct),
+            )
+        )
+
+        self._pointer_to_tracker_node = pointer_to_tracker
+        self._phantom_to_tracker_node = phantom_to_tracker
+        self._reference_to_ct_node = reference_to_ct
+
+        if needs_reobserve:
+            self._remove_input_observers()
+            for node in (self._pointer_to_tracker_node, self._phantom_to_tracker_node, self._reference_to_ct_node):
+                if node is None:
+                    continue
+                try:
+                    tag = node.AddObserver(vtk.vtkCommand.ModifiedEvent, self._on_input_modified)
+                except Exception:
+                    continue
+                self._input_observers.append((node, tag))
+
+        self._update_chain()
+
+    def _matrix_to_world(self, transform_node):
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToWorld(matrix)
+        return matrix
+
+    def _update_chain(self):
+        if (
+            self._pointer_to_tracker_node is None
+            or self._phantom_to_tracker_node is None
+            or self._reference_to_ct_node is None
+            or self._pointer_to_phantom_node is None
+            or self._pointer_to_ct_node is None
+        ):
+            return
+
+        try:
+            pointer_to_tracker = self._matrix_to_world(self._pointer_to_tracker_node)
+            phantom_to_tracker = self._matrix_to_world(self._phantom_to_tracker_node)
+            reference_to_ct = self._matrix_to_world(self._reference_to_ct_node)
+        except Exception:
+            return
+
+        if abs(phantom_to_tracker.Determinant()) < 1e-12:
+            return
+
+        inverse_phantom_to_tracker = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Invert(phantom_to_tracker, inverse_phantom_to_tracker)
+
+        pointer_to_phantom = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(inverse_phantom_to_tracker, pointer_to_tracker, pointer_to_phantom)
+        self._pointer_to_phantom_node.SetMatrixTransformToParent(pointer_to_phantom)
+
+        pointer_to_ct = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(reference_to_ct, pointer_to_phantom, pointer_to_ct)
+        # Damp tracker jitter on the displayed tool pose (no-op when disabled).
+        pointer_to_ct = self._stabilizer.smooth_matrix(pointer_to_ct)
+        self._pointer_to_ct_node.SetMatrixTransformToParent(pointer_to_ct)
+
+
+_AUTO_POINTER_TO_CT_CHAIN: Optional[_AutomaticPointerToCtChain] = None
+
+
+def _ensure_automatic_pointer_to_ct_chain_started():
+    global _AUTO_POINTER_TO_CT_CHAIN
+    if _AUTO_POINTER_TO_CT_CHAIN is None:
+        _AUTO_POINTER_TO_CT_CHAIN = _AutomaticPointerToCtChain(logging.getLogger(__name__))
+    _AUTO_POINTER_TO_CT_CHAIN.start()
+
+
+def _automatic_pointer_to_ct_chain() -> _AutomaticPointerToCtChain:
+    _ensure_automatic_pointer_to_ct_chain_started()
+    assert _AUTO_POINTER_TO_CT_CHAIN is not None
+    return _AUTO_POINTER_TO_CT_CHAIN
+
+
+class SpineTrackerWorkflow:
+    def __init__(
+        self,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+        log: Optional[logging.Logger] = None,
+    ):
+        self._status = status_callback
+        self._error = error_callback
+        self._log = log or logging.getLogger(__name__)
+
+        self._timer = qt.QTimer()
+        # Keep PLUS polling conservative; frequent polling can spam OpenIGTLink command messages
+        # if a previous command has not completed yet (flooding the console).
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._on_timeout)
+
+        self._phase: str = "idle"
+        self._phase_started_at_s: float = 0.0
+
+        self._params: Optional[WorkflowParams] = None
+
+        self._plus_remote_logic = None
+        self._launcher_node = None
+        self._server_node = None
+        self._config_text_node = None
+        self._config_storage_node = None
+        self._igtl_connector_node = None
+        self._timeout_igtl_connect_s = 15.0
+
+        self._ct_volume_node = None
+        self._vr_display_node = None
+        self._needle_model_node = None
+        self._needle_model_correction_node = None
+
+        self._ct_transform_node = None
+        self._needle_transform_node = None
+        self._pointer_to_tracker_node = None
+        self._reference_to_tracker_node = None
+        self._pointer_to_reference_input_node = None
+        self._reference_to_pointer_input_node = None
+        self._tracker_to_reference_node = None
+        self._pointer_to_reference_node = None
+        self._reference_to_ct_node = None
+        self._active_reference_frame_name: str = "Reference"
+        self._expected_transform_names: list[str] = []
+        self._needle_transform_observed_node = None
+        self._needle_transform_observer_tag: Optional[int] = None
+        self._pipeline_observers: list[tuple[object, int]] = []
+        self._pipeline_observer_signature: tuple = ()
+        self._last_needle_matrix: Optional[list[float]] = None
+        self._tracking_active = False
+        self._smoothing_strength: float = _DEFAULT_SMOOTHING_STRENGTH
+        self._stabilizer = _PoseStabilizer(_smoothing_strength_to_alpha(_DEFAULT_SMOOTHING_STRENGTH))
+        self._tracking_view_mode: str = "tool_centric"
+        self._crosshair_node = None
+        self._last_follow_update_at_s: float = 0.0
+        self._updating_tracking_pipeline = False
+        self._viewpoint_logic = None
+        self._viewpoint_instance = None
+        self._viewpoint_view_node = None
+        self._scan_centric_zoom_active = False
+        self._scan_centric_restore_fovs: dict[str, tuple[float, float, float]] = {}
+        self._scan_centric_base_fovs: dict[str, tuple[float, float, float]] = {}
+        self._scan_centric_zoom_volume_id: str = ""
+
+        self._registration_loaded: bool = False
+        self._registration_loaded_from: str = ""
+
+        self._timeout_connect_s = 30.0
+        self._timeout_server_s = 60.0
+        self._timeout_stop_s = 20.0
+        self._plus_started_locally: bool = False
+
+        self._plus_process: Optional[subprocess.Popen] = None
+        self._plus_working_dir: str = ""
+
+    # -----------------
+    # Public API
+    # -----------------
+
+    def is_running(self) -> bool:
+        return self._phase not in ("idle", "stopped", "error")
+
+    def set_smoothing_strength(self, strength: float):
+        """Set tracking jitter smoothing strength (0 = off, higher = steadier)."""
+        try:
+            value = float(strength)
+        except (TypeError, ValueError):
+            return
+        self._smoothing_strength = value
+        self._stabilizer.set_alpha(_smoothing_strength_to_alpha(value))
+        # Drop the running state so the new strength engages from the next
+        # sample instead of blending old smoothed output at the old rate.
+        self._stabilizer.reset()
+
+    def set_tracking_view_mode(self, mode: str):
+        normalized = _normalize_tracking_view_mode(mode)
+        if self._tracking_view_mode == normalized:
+            return
+        self._tracking_view_mode = normalized
+        self._configure_tracking_visualization()
+
+    def start(self, params: WorkflowParams):
+        self.stop()
+
+        self._params = params
+        self._plus_started_locally = True
+        self._registration_loaded = False
+        self._registration_loaded_from = ""
+        self._tracking_active = False
+        self._last_needle_matrix = None
+        self._last_follow_update_at_s = 0.0
+        self._ct_transform_node = None
+        self._needle_transform_node = None
+        self._status("ct", _StatusState.WAIT, "Waiting for CT load…")
+        self._status("registration", _StatusState.WAIT, "Registration: not applied")
+        self._status("vr", _StatusState.WAIT, "Waiting for volume rendering…")
+        self._status("needle", _StatusState.WAIT, "Waiting for needle model…")
+        self._status("transforms", _StatusState.WAIT, "Waiting for transforms…")
+        self._status("tracking", _StatusState.WAIT, "Waiting for tracking…")
+
+        if params.plus_mode == "internal" and params.plus_exe_path and params.phantom_geometry_path and params.tool_geometry_path:
+            # Internal mode: launch PlusServer as subprocess
+            self._status("launcher", _StatusState.WAIT, "Launching internal PlusServer…")
+            self._status("server", _StatusState.WAIT, "Starting PlusServer subprocess…")
+            try:
+                self._start_internal_plus()
+                self._expected_transform_names = ["PointerToPhantom", "PointerToTracker", "PhantomToTracker", "PhantomToPointer"]
+                self._set_phase("running")
+                self._status("server", _StatusState.OK, "PlusServer running (internal)")
+                self._prepare_and_register_expected_transforms()
+                self._ensure_ct_loaded()
+                self._ensure_vr_enabled()
+                self._ensure_needle_loaded()
+            except Exception as exc:
+                self._fail(f"Internal PlusServer setup failed: {exc}")
+                return
+            self._timer.start()
+        else:
+            # External mode: connect to PlusServerLauncher via PlusRemote
+            self._expected_transform_names = self._parse_transform_names_from_plus_config_path(params.plus_config_path)
+            self._set_phase("starting_plus")
+            self._status("launcher", _StatusState.WAIT, f"Connecting to PlusServerLauncher ({params.launcher_host}:{params.launcher_port})…")
+            self._status("server", _StatusState.WAIT, "Starting PLUS server…")
+            try:
+                self._ensure_plus_remote_available()
+                self._setup_plus_nodes()
+            except Exception as exc:
+                self._fail(f"PLUS setup failed: {exc}")
+                return
+            self._timer.start()
+
+    def stop(self):
+        if self._timer is not None:
+            self._timer.stop()
+        self._remove_observers()
+        self._disable_tool_dynamic_view()
+
+        if self._igtl_connector_node is not None:
+            try:
+                self._igtl_connector_node.Stop()
+            except Exception:
+                pass
+
+        if self._plus_started_locally:
+            if self._server_node is not None:
+                try:
+                    self._server_node.SetControlledLocally(True)
+                    self._server_node.StopServer()
+                except Exception:
+                    # Best-effort only
+                    pass
+
+            # Stop OpenIGTLink connectors created for the PLUS server (best-effort)
+            try:
+                if self._server_node is not None:
+                    for connector in self._server_node.GetPlusOpenIGTLinkConnectorNodes():
+                        if connector is not None:
+                            connector.Stop()
+            except Exception:
+                pass
+
+            # Kill the locally-spawned PlusServer subprocess (if any) BEFORE
+            # the deferred launcher-stop path below: that path returns early
+            # and never killed the child, leaking a PlusServer.exe that kept
+            # streaming on 18944 and holding the Atracsys camera.
+            self._kill_plus_server_subprocess()
+
+            if self._server_node is not None and self._plus_remote_logic is not None:
+                try:
+                    self._set_phase("stopping_plus")
+                    self._phase_started_at_s = time.time()
+                    self._timer.start()
+                    return
+                except Exception:
+                    pass
+
+        self._kill_plus_server_subprocess()
+        self._plus_started_locally = False
+        self._set_phase("idle")
+
+    def destroy(self):
+        """Full teardown — delete timer, disconnect IGTL, remove nodes from scene."""
+        self.stop()
+        # stop() may have deferred into the stopping_plus phase, whose timer
+        # we are about to delete — finalize the stop synchronously so nothing
+        # is left running or flagged.
+        self._kill_plus_server_subprocess()
+        self._plus_started_locally = False
+        if self._timer is not None:
+            self._timer.deleteLater()
+            self._timer = None
+        self._disconnect_openigtlink()
+
+    # -----------------
+    # Internals
+    # -----------------
+
+    def _set_phase(self, phase: str):
+        self._phase = phase
+        self._phase_started_at_s = time.time()
+
+    def _seconds_in_phase(self) -> float:
+        return time.time() - self._phase_started_at_s
+
+    def _fail(self, message: str):
+        self._set_phase("error")
+        self._timer.stop()
+        self._remove_observers()
+        self._status("launcher", _StatusState.ERR, "Launcher: error")
+        self._status("server", _StatusState.ERR, "Server: error")
+        self._status("registration", _StatusState.ERR, "Registration: error")
+        self._status("tracking", _StatusState.ERR, "Tracking: error")
+        self._error(message)
+
+    def _ensure_plus_remote_available(self):
+        if not hasattr(slicer.modules, "plusremote"):
+            raise RuntimeError("PlusRemote module is not available in this build")
+
+        self._plus_remote_logic = slicer.modules.plusremote.logic()
+        if self._plus_remote_logic is None:
+            raise RuntimeError("PlusRemote logic could not be initialized")
+
+    def _setup_plus_nodes(self):
+        assert self._params is not None
+
+        launcher_name = "SpineTracker2_PlusServerLauncher"
+        launcher_node = slicer.util.getFirstNodeByClassByName("vtkMRMLPlusServerLauncherNode", launcher_name)
+        if launcher_node is None:
+            launcher_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlusServerLauncherNode", launcher_name)
+        launcher_node.SetHostname(self._params.launcher_host)
+        launcher_node.SetPort(int(self._params.launcher_port))
+        self._launcher_node = launcher_node
+
+        # Read config file into a MRML text node (reuse nodes if they already exist)
+        server_id = self._stable_server_id_from_path(self._params.plus_config_path)
+        config_text_name = "SpineTracker2_PlusConfig"
+        config_text_node = slicer.util.getFirstNodeByClassByName("vtkMRMLTextNode", config_text_name)
+        if config_text_node is None:
+            config_text_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTextNode", config_text_name)
+        config_text_node.SetAttribute("PlusServer.serverID", server_id)
+        self._config_text_node = config_text_node
+
+        if config_text_node.GetStorageNode() is not None:
+            config_storage_node = config_text_node.GetStorageNode()
+        else:
+            config_storage_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTextStorageNode")
+            config_text_node.SetAndObserveStorageNodeID(config_storage_node.GetID())
+        config_storage_node.SetFileName(self._params.plus_config_path)
+        if config_storage_node.ReadData(config_text_node) == -1:
+            raise RuntimeError("Could not read PLUS config XML")
+        self._config_storage_node = config_storage_node
+
+        server_name = "SpineTracker2_PlusServer"
+        server_node = slicer.util.getFirstNodeByClassByName("vtkMRMLPlusServerNode", server_name)
+        if server_node is None:
+            server_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlusServerNode", server_name)
+        server_node.SetAndObserveConfigNode(config_text_node)
+        server_node.SetControlledLocally(True)
+        server_node.StartServer()
+        self._server_node = server_node
+
+        # Link server to launcher (idempotent if already referenced)
+        launcher_node.AddAndObserveServerNode(server_node)
+
+        # Kick an initial update so the launcher connector is created ASAP
+        self._plus_remote_logic.UpdateLauncher(launcher_node)
+
+    def _stable_server_id_from_path(self, path: str) -> str:
+        base = os.path.basename(path)
+        # Handle .plus.xml and plain .xml and any other suffixes
+        for suffix in (".plus.xml", ".xml"):
+            if base.lower().endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        base = base.strip().replace(" ", "_")
+        return base or "PlusServer"
+
+    # ---- Internal PlusServer (subprocess) management ----
+
+    def _find_template_xml(self) -> str:
+        """Locate the bundled Registration_Tracking_Template.xml."""
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "Resources", "Registration_Tracking_Template.xml"),
+        ]
+        if hasattr(slicer, "app"):
+            candidates.append(
+                os.path.join(slicer.app.slicerHome, "share", "SpineTracker2-5.11", "Registration_Tracking_Template.xml")
+            )
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        raise RuntimeError("Registration_Tracking_Template.xml not found in module Resources")
+
+    @staticmethod
+    def find_bundled_plus_server() -> str:
+        """Return the path to the bundled PlusServer.exe, or empty string if not found."""
+        candidates = []
+        if hasattr(slicer, "app"):
+            slicer_home = slicer.app.slicerHome
+            # Installed / packaged locations (most to least likely)
+            candidates.append(os.path.join(slicer_home, "lib", "PlusServer", "PlusServer.exe"))
+            candidates.append(os.path.join(slicer_home, "bin", "PlusServer", "PlusServer.exe"))
+            candidates.append(os.path.join(slicer_home, "PlusServer", "PlusServer.exe"))
+            # In case slicerHome points to a subfolder (e.g. bin), look one level up
+            candidates.append(os.path.join(slicer_home, "..", "lib", "PlusServer", "PlusServer.exe"))
+            candidates.append(os.path.join(slicer_home, "..", "PlusServer", "PlusServer.exe"))
+            # Development build: PlusServer folder next to Slicer-build (sibling in build root)
+            candidates.append(os.path.join(slicer_home, "..", "..", "PlusServer", "PlusServer.exe"))
+        # Source-tree location
+        candidates.append(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "Resources", "PlusServer", "PlusServer.exe"))
+        # Last-resort walk from module's grand-ancestor dirs (handles unusual install layouts)
+        try:
+            module_root = os.path.dirname(__file__)
+            for depth in range(6):
+                base = os.path.normpath(os.path.join(module_root, *([".."] * depth)))
+                candidate = os.path.join(base, "lib", "PlusServer", "PlusServer.exe")
+                candidates.append(candidate)
+                candidate = os.path.join(base, "PlusServer", "PlusServer.exe")
+                candidates.append(candidate)
+        except Exception:
+            pass
+        for p in candidates:
+            try:
+                normed = os.path.normpath(p)
+                if os.path.isfile(normed):
+                    return normed
+            except Exception:
+                continue
+        return ""
+
+    def _start_internal_plus(self):
+        """Generate config, launch PlusServer subprocess, wait for port, connect via OpenIGTLink."""
+        assert self._params is not None
+        igtl_port = 18944
+
+        template_path = self._find_template_xml()
+        self._plus_working_dir = os.path.join(slicer.app.temporaryPath, "SpineTracker2_PlusServer")
+
+        generated_xml = _generate_plus_config(
+            template_path,
+            self._params.phantom_geometry_path,
+            self._params.tool_geometry_path,
+            self._plus_working_dir,
+            igtl_port,
+        )
+        self._log.info("Generated PlusServer config: %s", generated_xml)
+
+        self._launch_plus_server_subprocess(self._params.plus_exe_path, generated_xml)
+
+        self._status("launcher", _StatusState.WAIT, "Waiting for PlusServer to start...")
+        if not _wait_for_port("localhost", igtl_port, timeout_s=15.0):
+            self._kill_plus_server_subprocess()
+            raise RuntimeError(f"PlusServer did not start within 15 seconds on port {igtl_port}")
+
+        self._status("launcher", _StatusState.OK, "PlusServer running")
+        self._connect_openigtlink_client("localhost", igtl_port)
+        self._plus_started_locally = True
+
+    def _launch_plus_server_subprocess(self, plus_exe_path: str, config_xml_path: str):
+        """Launch PlusServer.exe as a child process."""
+        self._kill_plus_server_subprocess()
+
+        if not os.path.isfile(plus_exe_path):
+            raise RuntimeError(f"PlusServer.exe not found: {plus_exe_path}")
+        if not os.path.isfile(config_xml_path):
+            raise RuntimeError(f"PlusServer config not found: {config_xml_path}")
+
+        plusserver_dir = os.path.dirname(os.path.abspath(plus_exe_path))
+        atracsys_runtime_dirs, bundle_missing, unresolved_runtime_files = _resolve_atracsys_runtime_dirs(plusserver_dir)
+        launch_env = _build_subprocess_env([plusserver_dir] + atracsys_runtime_dirs)
+        cmd = [plus_exe_path, "--config-file=" + config_xml_path]
+        self._log.info("Launching PlusServer: %s", " ".join(cmd))
+        self._log.info("PlusServer launch working directory: %s", plusserver_dir)
+        if bundle_missing:
+            self._log.warning(
+                "Bundled PlusServer is missing Atracsys runtime companions: %s",
+                ", ".join(bundle_missing),
+            )
+        if atracsys_runtime_dirs:
+            self._log.info(
+                "Atracsys runtime fallback directories: %s",
+                "; ".join(atracsys_runtime_dirs),
+            )
+        if unresolved_runtime_files:
+            self._log.warning(
+                "Atracsys runtime companions still unresolved after fallback lookup: %s",
+                ", ".join(unresolved_runtime_files),
+            )
+
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        self._plus_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=plusserver_dir,
+            env=launch_env,
+            creationflags=creationflags,
+        )
+        # Assign to the kill-on-close Job Object so the OS terminates
+        # PlusServer even when Slicer dies without running atexit (Task
+        # Manager kill, crash, power loss) — an orphaned PlusServer keeps
+        # the Atracsys camera locked, blocking the next launch. No-op off
+        # Windows.
+        try:
+            _assign_process_to_plus_job(self._plus_process.pid)
+        except Exception:
+            pass
+        if not getattr(self, "_atexit_registered", False):
+            atexit.register(self._kill_plus_server_subprocess)
+            self._atexit_registered = True
+
+        # Quick check that it didn't die immediately
+        time.sleep(0.5)
+        if self._plus_process.poll() is not None:
+            rc = self._plus_process.returncode
+            self._plus_process = None
+            raise RuntimeError(f"PlusServer exited immediately with code {rc}")
+
+    def _kill_plus_server_subprocess(self):
+        """Terminate the PlusServer subprocess if running."""
+        if self._plus_process is None:
+            return
+        try:
+            self._plus_process.terminate()
+            try:
+                self._plus_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._plus_process.kill()
+                self._plus_process.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            # TimeoutExpired (a SubprocessError, not an OSError) from the
+            # post-kill wait must not escape into stop()/start() teardown.
+            pass
+        self._plus_process = None
+        self._log.info("PlusServer subprocess terminated")
+
+    def _on_timeout(self):
+        try:
+            if self._phase == "starting_plus":
+                self._tick_starting_plus()
+            elif self._phase == "running":
+                self._tick_running()
+            elif self._phase == "stopping_plus":
+                self._tick_stopping_plus()
+            else:
+                return
+        except Exception as exc:
+            self._fail(f"Unexpected error: {exc}")
+
+    def _tick_starting_plus(self):
+        assert self._params is not None
+        if self._launcher_node is None or self._server_node is None:
+            self._fail("Internal error: missing PLUS nodes")
+            return
+
+        self._plus_remote_logic.UpdateLauncher(self._launcher_node)
+        self._plus_remote_logic.UpdateServer(self._server_node)
+
+        launcher_connected = self._is_launcher_connected()
+        if launcher_connected:
+            self._status("launcher", _StatusState.OK, "Launcher connected")
+        else:
+            if self._seconds_in_phase() > self._timeout_connect_s:
+                self._fail(
+                    f"Could not connect to PlusServerLauncher at {self._params.launcher_host}:{self._params.launcher_port} "
+                    f"within {int(self._timeout_connect_s)}s"
+                )
+                return
+            self._status("launcher", _StatusState.WAIT, "Launcher connecting…")
+
+        server_on = self._is_server_on()
+        if server_on:
+            self._status("server", _StatusState.OK, "Server started")
+        else:
+            if self._seconds_in_phase() > self._timeout_server_s:
+                self._fail(f"PLUS server did not start within {int(self._timeout_server_s)}s")
+                return
+            self._status("server", _StatusState.WAIT, f"Server state: {self._server_state_string()}")
+
+        if launcher_connected and server_on:
+            # Prepare expected transform nodes and register them on all server connectors to ensure they are received.
+            self._prepare_and_register_expected_transforms()
+
+            # Load CT and needle once PLUS is ready
+            self._load_ct_and_enable_vr()
+            self._load_needle_model()
+
+            self._set_phase("running")
+            self._tick_running()
+
+    def _tick_running(self):
+        # Keep PLUS nodes updated
+        if self._launcher_node is not None and self._server_node is not None and self._plus_remote_logic is not None:
+            self._plus_remote_logic.UpdateLauncher(self._launcher_node)
+            self._plus_remote_logic.UpdateServer(self._server_node)
+
+        self._attach_transforms_if_available()
+
+    def _tick_stopping_plus(self):
+        if self._launcher_node is not None and self._server_node is not None and self._plus_remote_logic is not None:
+            self._plus_remote_logic.UpdateLauncher(self._launcher_node)
+            self._plus_remote_logic.UpdateServer(self._server_node)
+
+        if self._server_node is None:
+            self._plus_started_locally = False
+            self._set_phase("idle")
+            return
+
+        if int(self._server_node.GetState()) == 0:  # Off
+            self._status("server", _StatusState.OK, "Server stopped")
+            self._plus_started_locally = False
+            self._set_phase("idle")
+            self._timer.stop()
+            return
+
+        if self._seconds_in_phase() > self._timeout_stop_s:
+            self._status("server", _StatusState.ERR, f"Server stop timeout ({self._server_state_string()})")
+            self._plus_started_locally = False
+            self._set_phase("idle")
+            self._timer.stop()
+            return
+
+        self._status("server", _StatusState.WAIT, f"Stopping ({self._server_state_string()})…")
+
+    def _is_launcher_connected(self) -> bool:
+        if self._launcher_node is None:
+            return False
+        connector = self._launcher_node.GetConnectorNode()
+        if connector is None:
+            return False
+        return connector.GetState() == slicer.vtkMRMLIGTLConnectorNode.StateConnected
+
+    def _is_server_on(self) -> bool:
+        if self._server_node is None:
+            return False
+        # Enum values: Off=0, On=1, Starting=2, Stopping=3
+        return int(self._server_node.GetState()) == 1 and int(self._server_node.GetDesiredState()) == 1
+
+    def _server_state_string(self) -> str:
+        if self._server_node is None:
+            return "Unknown"
+        state = int(self._server_node.GetState())
+        return {0: "Off", 1: "On", 2: "Starting", 3: "Stopping"}.get(state, str(state))
+
+    def _prepare_and_register_expected_transforms(self):
+        assert self._params is not None
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=self._params.ct_transform_name,
+            pointer_to_ct_name=self._params.needle_transform_name,
+        )
+
+        if self._server_node is None:
+            return
+
+        connectors = []
+        try:
+            connectors = list(self._server_node.GetPlusOpenIGTLinkConnectorNodes())
+        except Exception:
+            connectors = []
+        for connector in connectors:
+            if connector is None:
+                continue
+            self._register_connector_for_navigation_streams(connector, self._expected_transform_names)
+
+    def _get_or_create_linear_transform(self, name: str):
+        existing = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", name)
+        if existing is None:
+            existing = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        try:
+            existing.SetHideFromEditors(False)
+        except Exception:
+            pass
+        return existing
+
+    def _set_transform_matrix(self, transform_node, rows: tuple[tuple[float, float, float, float], ...]):
+        if transform_node is None:
+            return
+        matrix = vtk.vtkMatrix4x4()
+        for row_index, row in enumerate(rows):
+            for column_index, value in enumerate(row):
+                matrix.SetElement(row_index, column_index, float(value))
+        transform_node.SetMatrixTransformToParent(matrix)
+
+    def _set_registration_metadata(
+        self,
+        transform_node,
+        method: str,
+        source: str,
+        rmse_mm: Optional[float] = None,
+    ):
+        if transform_node is None:
+            return
+        try:
+            transform_node.SetAttribute(_REGISTRATION_METHOD_ATTRIBUTE, str(method or "").strip())
+        except Exception:
+            pass
+        try:
+            transform_node.SetAttribute(_REGISTRATION_SOURCE_ATTRIBUTE, str(source or "").strip())
+        except Exception:
+            pass
+        try:
+            transform_node.SetAttribute(
+                _REGISTRATION_RMSE_ATTRIBUTE,
+                "" if rmse_mm is None else f"{float(rmse_mm):.6g}",
+            )
+        except Exception:
+            pass
+
+    def _ensure_needle_model_correction_node(self):
+        if self._needle_transform_node is None:
+            self._needle_model_correction_node = None
+            return None
+
+        correction_node = self._get_or_create_linear_transform(_NEEDLE_MODEL_TO_POINTER_CORRECTION_NAME)
+        self._set_transform_matrix(correction_node, _NEEDLE_MODEL_TO_POINTER_CORRECTION_MATRIX)
+
+        needle_transform_id = self._needle_transform_node.GetID() if self._needle_transform_node is not None else ""
+        try:
+            current_parent_id = correction_node.GetTransformNodeID() or ""
+        except Exception:
+            current_parent_id = ""
+        if needle_transform_id and current_parent_id != needle_transform_id:
+            correction_node.SetAndObserveTransformNodeID(needle_transform_id)
+
+        self._needle_model_correction_node = correction_node
+        return correction_node
+
+    def _configure_needle_model_display(self, model_node=None):
+        if model_node is None:
+            model_node = self._needle_model_node
+        if model_node is None:
+            return
+
+        try:
+            model_node.CreateDefaultDisplayNodes()
+        except Exception:
+            pass
+
+        display = model_node.GetDisplayNode() if hasattr(model_node, "GetDisplayNode") else None
+        if display is None:
+            return
+
+        try:
+            display.SetColor(79.0 / 255.0, 134.0 / 255.0, 1.0)
+        except Exception:
+            pass
+        try:
+            display.SetOpacity(1.0)
+        except Exception:
+            pass
+        try:
+            display.SetVisibility(True)
+        except Exception:
+            pass
+        try:
+            display.SetVisibility2D(True)
+        except Exception:
+            try:
+                display.SetSliceIntersectionVisibility(True)
+            except Exception:
+                pass
+        # In scan-centric mode the slice planes stay axial/sagittal/coronal and
+        # cut across the needle, so the intersection is just a tiny dot. Project
+        # the whole model onto the slice instead so the full needle is visible.
+        # In tool-aligned modes the needle lies in-plane and intersection is the
+        # cleaner display.
+        try:
+            if self._tracking_view_mode == "scan_centric":
+                display.SetSliceDisplayModeToProjection()
+            else:
+                display.SetSliceDisplayModeToIntersection()
+        except Exception:
+            pass
+        try:
+            display.SetSliceIntersectionThickness(3)
+        except Exception:
+            pass
+        try:
+            display.SetSliceIntersectionOpacity(1.0)
+        except Exception:
+            pass
+        try:
+            display.SetLineWidth(2.5)
+        except Exception:
+            pass
+
+    def _attach_needle_model_to_tracking_chain(self, model_node=None):
+        if model_node is None:
+            model_node = self._needle_model_node
+        if model_node is None:
+            return
+
+        correction_node = self._ensure_needle_model_correction_node()
+        target_node = correction_node or self._needle_transform_node
+        if target_node is None:
+            return
+
+        target_id = target_node.GetID() or ""
+        if not target_id:
+            return
+        try:
+            current_id = model_node.GetTransformNodeID() or ""
+        except Exception:
+            current_id = ""
+        if current_id != target_id:
+            model_node.SetAndObserveTransformNodeID(target_id)
+        self._configure_needle_model_display(model_node)
+
+    def _clear_parent_transform(self, node):
+        if node is None:
+            return
+        try:
+            node.SetAndObserveTransformNodeID(None)
+        except Exception:
+            try:
+                node.SetAndObserveTransformNodeID("")
+            except Exception:
+                pass
+
+    def _get_transform_matrix_to_parent(self, transform_node) -> vtk.vtkMatrix4x4:
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToParent(matrix)
+        return matrix
+
+    def _parse_transform_names_from_plus_config_path(self, xml_path: str) -> list[str]:
+        if not xml_path or not os.path.isfile(xml_path):
+            return []
+        try:
+            with open(xml_path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+        except Exception:
+            return []
+        try:
+            root = ET.fromstring(content)
+        except Exception:
+            return []
+
+        names: list[str] = []
+        for elem in root.findall(".//TransformNames/Transform"):
+            name = elem.get("Name")
+            if name:
+                names.append(str(name))
+
+        unique: list[str] = []
+        seen = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        return unique
+
+    def _all_scene_transform_names(self) -> list[str]:
+        names: list[str] = []
+        for transform_node in slicer.util.getNodesByClass("vtkMRMLTransformNode"):
+            if transform_node is None:
+                continue
+            try:
+                name = (transform_node.GetName() or "").strip()
+            except Exception:
+                name = ""
+            if name:
+                names.append(name)
+        return names
+
+    def _ordered_transform_names_for_detection(self) -> list[str]:
+        ordered: list[str] = []
+        seen = set()
+        for name in list(self._expected_transform_names) + self._all_scene_transform_names():
+            normalized = (name or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
+
+    def _resolve_tracking_input_selection(self) -> Optional[TrackingInputSelection]:
+        candidate_names = self._ordered_transform_names_for_detection()
+        if not candidate_names:
+            candidate_names = [
+                _LIVE_REFERENCE_TO_TRACKER_NAME,
+                "PhantomToTracker",
+                _LIVE_POINTER_TO_TRACKER_NAME,
+                "PointerToPhantom",
+                "PhantomToPointer",
+            ]
+
+        tracker_reference_candidates: list[tuple[str, str]] = []
+        for name in candidate_names:
+            if not name.endswith("ToTracker"):
+                continue
+            if name.lower().startswith("pointerto"):
+                continue
+            reference_frame_name = name[: -len("ToTracker")].strip()
+            if not reference_frame_name:
+                continue
+            tracker_reference_candidates.append((name, reference_frame_name))
+
+        preferred_candidates = [
+            (_LIVE_REFERENCE_TO_TRACKER_NAME, "Reference"),
+            ("PhantomToTracker", "Phantom"),
+        ]
+        for candidate in reversed(preferred_candidates):
+            if candidate in tracker_reference_candidates:
+                tracker_reference_candidates.remove(candidate)
+                tracker_reference_candidates.insert(0, candidate)
+
+        for reference_to_tracker_name, reference_frame_name in tracker_reference_candidates:
+            reference_to_tracker_node = self._find_transform_node(reference_to_tracker_name)
+            if reference_to_tracker_node is None:
+                continue
+
+            pointer_to_reference_name = f"PointerTo{reference_frame_name}"
+            reference_to_pointer_name = f"{reference_frame_name}ToPointer"
+            pointer_to_reference_node = self._find_transform_node(pointer_to_reference_name)
+            reference_to_pointer_node = self._find_transform_node(reference_to_pointer_name)
+            pointer_to_tracker_node = self._find_transform_node(_LIVE_POINTER_TO_TRACKER_NAME)
+            # Never select one of the pipeline's own OUTPUT nodes as an
+            # input: _ensure_navigation_pipeline_nodes pre-creates
+            # "PointerToReference" (identity) as the pipeline output, and
+            # feeding it back in here made the pipeline read its own
+            # never-updated output instead of composing the live streams.
+            if self._is_own_pipeline_output(pointer_to_reference_node):
+                pointer_to_reference_node = None
+            if self._is_own_pipeline_output(reference_to_pointer_node):
+                reference_to_pointer_node = None
+
+            if pointer_to_reference_node is not None:
+                return TrackingInputSelection(
+                    reference_frame_name=reference_frame_name,
+                    reference_to_tracker_node=reference_to_tracker_node,
+                    pointer_to_reference_node=pointer_to_reference_node,
+                )
+            if reference_to_pointer_node is not None:
+                return TrackingInputSelection(
+                    reference_frame_name=reference_frame_name,
+                    reference_to_tracker_node=reference_to_tracker_node,
+                    reference_to_pointer_node=reference_to_pointer_node,
+                )
+            if pointer_to_tracker_node is not None:
+                return TrackingInputSelection(
+                    reference_frame_name=reference_frame_name,
+                    reference_to_tracker_node=reference_to_tracker_node,
+                    pointer_to_tracker_node=pointer_to_tracker_node,
+                )
+
+        direct_reference_candidates = ("PointerToPhantom", "PointerToReference")
+        for name in direct_reference_candidates:
+            node = self._find_transform_node(name)
+            if node is not None and not self._is_own_pipeline_output(node):
+                reference_frame_name = name.split("To", 1)[1]
+                return TrackingInputSelection(
+                    reference_frame_name=reference_frame_name,
+                    pointer_to_reference_node=node,
+                )
+
+        inverse_reference_candidates = ("PhantomToPointer", "ReferenceToPointer")
+        for name in inverse_reference_candidates:
+            node = self._find_transform_node(name)
+            if node is not None and not self._is_own_pipeline_output(node):
+                reference_frame_name = name.split("To", 1)[0]
+                return TrackingInputSelection(
+                    reference_frame_name=reference_frame_name,
+                    reference_to_pointer_node=node,
+                )
+
+        return None
+
+    def _is_own_pipeline_output(self, node) -> bool:
+        """True when node is one of the transforms this pipeline WRITES —
+        selecting it as an input would make the pipeline read its own
+        output (identity until written) and go inert."""
+        if node is None:
+            return False
+        return (
+            node is self._pointer_to_reference_node
+            or node is self._tracker_to_reference_node
+            or node is self._needle_transform_node
+        )
+
+    def _selection_has_pointer_input(self, selection: Optional[TrackingInputSelection]) -> bool:
+        if selection is None:
+            return False
+        if selection.pointer_to_reference_node is not None or selection.reference_to_pointer_node is not None:
+            return True
+        return selection.pointer_to_tracker_node is not None and selection.reference_to_tracker_node is not None
+
+    def _ensure_navigation_pipeline_nodes(self, reference_to_ct_name: str, pointer_to_ct_name: str):
+        self._tracker_to_reference_node = self._get_or_create_linear_transform(_TRACKER_TO_REFERENCE_NAME)
+        self._pointer_to_reference_node = self._get_or_create_linear_transform(_POINTER_TO_REFERENCE_NAME)
+        self._reference_to_ct_node = self._get_or_create_linear_transform(reference_to_ct_name or _DEFAULT_REFERENCE_TO_CT_NAME)
+        self._needle_transform_node = self._get_or_create_linear_transform(pointer_to_ct_name or _DEFAULT_POINTER_TO_CT_NAME)
+        self._ct_transform_node = self._reference_to_ct_node
+
+        for node in (
+            self._tracker_to_reference_node,
+            self._pointer_to_reference_node,
+            self._reference_to_ct_node,
+            self._needle_transform_node,
+        ):
+            self._clear_parent_transform(node)
+
+        self._ensure_needle_model_correction_node()
+        self._attach_needle_model_to_tracking_chain()
+
+    def _register_connector_for_navigation_streams(
+        self,
+        connector,
+        expected_transform_names: Optional[list[str]] = None,
+    ):
+        if connector is None:
+            return
+
+        candidate_names: list[str] = []
+        for name in (
+            list(expected_transform_names or [])
+            + list(self._expected_transform_names)
+            + [
+                _LIVE_POINTER_TO_TRACKER_NAME,
+                _LIVE_REFERENCE_TO_TRACKER_NAME,
+                "PhantomToTracker",
+                "PointerToPhantom",
+                "PhantomToPointer",
+                "PointerToReference",
+                "ReferenceToPointer",
+            ]
+        ):
+            normalized = (name or "").strip()
+            if not normalized or normalized in candidate_names:
+                continue
+            candidate_names.append(normalized)
+
+        names_to_skip = {
+            self._reference_to_ct_node.GetName() if self._reference_to_ct_node is not None else "",
+            self._needle_transform_node.GetName() if self._needle_transform_node is not None else "",
+            _TRACKER_TO_REFERENCE_NAME,
+            _POINTER_TO_REFERENCE_NAME,
+            _NEEDLE_MODEL_TO_POINTER_CORRECTION_NAME,
+        }
+        nodes_to_register = []
+        for name in candidate_names:
+            if name in names_to_skip:
+                continue
+            try:
+                nodes_to_register.append(self._get_or_create_linear_transform(str(name)))
+            except Exception:
+                continue
+
+        for node in nodes_to_register:
+            if node is None:
+                continue
+            try:
+                connector.RegisterIncomingMRMLNode(node)
+            except Exception:
+                # Best-effort only; incoming devices may still be auto-created.
+                pass
+
+    def _remove_pipeline_observers(self):
+        self._pipeline_observer_signature = ()
+        while self._pipeline_observers:
+            node, tag = self._pipeline_observers.pop()
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+
+    def _observe_navigation_pipeline_inputs(self):
+        selection = self._resolve_tracking_input_selection()
+        # This runs from the 1 s workflow tick. If the resolved inputs are the
+        # same nodes we already observe, keep everything as-is: tearing down and
+        # re-adding observers every second causes event churn, and resetting the
+        # stabilizer would discard the smoothing state once per second.
+        signature = tuple(
+            (node.GetID() or "") if node is not None else ""
+            for node in (
+                selection.pointer_to_tracker_node if selection else None,
+                selection.reference_to_tracker_node if selection else None,
+                selection.pointer_to_reference_node if selection else None,
+                selection.reference_to_pointer_node if selection else None,
+                self._reference_to_ct_node,
+            )
+        )
+        if signature == self._pipeline_observer_signature and self._pipeline_observers:
+            return
+        self._remove_pipeline_observers()
+        # Inputs genuinely changed (fresh stream or different reference frame):
+        # discard the smoothing state to avoid blending across the discontinuity.
+        self._stabilizer.reset()
+        if selection is not None:
+            self._active_reference_frame_name = selection.reference_frame_name or "Reference"
+            self._pointer_to_tracker_node = selection.pointer_to_tracker_node
+            self._reference_to_tracker_node = selection.reference_to_tracker_node
+            self._pointer_to_reference_input_node = selection.pointer_to_reference_node
+            self._reference_to_pointer_input_node = selection.reference_to_pointer_node
+        else:
+            self._pointer_to_tracker_node = None
+            self._reference_to_tracker_node = None
+            self._pointer_to_reference_input_node = None
+            self._reference_to_pointer_input_node = None
+
+        nodes_to_observe = [
+            self._pointer_to_tracker_node,
+            self._reference_to_tracker_node,
+            self._pointer_to_reference_input_node,
+            self._reference_to_pointer_input_node,
+            self._reference_to_ct_node,
+        ]
+        for node in nodes_to_observe:
+            if node is None:
+                continue
+            try:
+                tag = node.AddObserver(vtk.vtkCommand.ModifiedEvent, self._on_navigation_pipeline_input_modified)
+            except Exception:
+                continue
+            self._pipeline_observers.append((node, tag))
+        self._pipeline_observer_signature = signature
+
+    def _on_navigation_pipeline_input_modified(self, _caller, _event_id):
+        try:
+            self._update_navigation_pipeline()
+        except Exception as exc:
+            self._status("tracking", _StatusState.ERR, f"Tracking pipeline: {exc}")
+
+    def _update_navigation_pipeline(self):
+        if self._updating_tracking_pipeline:
+            return
+        selection = self._resolve_tracking_input_selection()
+        if (
+            selection is None
+            or self._reference_to_ct_node is None
+            or self._tracker_to_reference_node is None
+            or self._pointer_to_reference_node is None
+            or self._needle_transform_node is None
+        ):
+            return
+
+        self._updating_tracking_pipeline = True
+        try:
+            self._active_reference_frame_name = selection.reference_frame_name or "Reference"
+            self._pointer_to_tracker_node = selection.pointer_to_tracker_node
+            self._reference_to_tracker_node = selection.reference_to_tracker_node
+            self._pointer_to_reference_input_node = selection.pointer_to_reference_node
+            self._reference_to_pointer_input_node = selection.reference_to_pointer_node
+
+            reference_to_ct = self._get_transform_matrix_to_parent(self._reference_to_ct_node)
+            pointer_to_reference = vtk.vtkMatrix4x4()
+            tracker_to_reference = vtk.vtkMatrix4x4()
+            tracker_to_reference.Identity()
+            tracker_to_reference_ready = False
+
+            if selection.reference_to_tracker_node is not None:
+                reference_to_tracker = self._get_transform_matrix_to_parent(selection.reference_to_tracker_node)
+                if abs(reference_to_tracker.Determinant()) >= 1e-12:
+                    vtk.vtkMatrix4x4.Invert(reference_to_tracker, tracker_to_reference)
+                    tracker_to_reference_ready = True
+
+            if selection.pointer_to_reference_node is not None:
+                pointer_to_reference.DeepCopy(
+                    self._get_transform_matrix_to_parent(selection.pointer_to_reference_node)
+                )
+            elif selection.reference_to_pointer_node is not None:
+                reference_to_pointer = self._get_transform_matrix_to_parent(selection.reference_to_pointer_node)
+                if abs(reference_to_pointer.Determinant()) < 1e-12:
+                    raise RuntimeError(f"{selection.reference_to_pointer_node.GetName()} is singular (cannot invert)")
+                vtk.vtkMatrix4x4.Invert(reference_to_pointer, pointer_to_reference)
+            elif selection.pointer_to_tracker_node is not None and selection.reference_to_tracker_node is not None:
+                pointer_to_tracker = self._get_transform_matrix_to_parent(selection.pointer_to_tracker_node)
+                if not tracker_to_reference_ready:
+                    raise RuntimeError(f"{selection.reference_to_tracker_node.GetName()} is singular (cannot invert)")
+                # Slicer stores transforms as child-to-parent matrices. To apply the chain
+                # Pointer -> Tracker -> Reference -> CT, the rightmost transform acts first.
+                vtk.vtkMatrix4x4.Multiply4x4(tracker_to_reference, pointer_to_tracker, pointer_to_reference)
+            else:
+                return
+
+            self._tracker_to_reference_node.SetMatrixTransformToParent(tracker_to_reference)
+            self._pointer_to_reference_node.SetMatrixTransformToParent(pointer_to_reference)
+
+            pointer_to_ct = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Multiply4x4(reference_to_ct, pointer_to_reference, pointer_to_ct)
+            # Single-writer guard: the module-level automatic chain also
+            # derives this exact node (from PhantomToTracker/PointerToTracker).
+            # When it is active and able, let it own the write — two writers
+            # with independent smoothing filters make the displayed pose
+            # flicker between two differently-filtered values and corrupt
+            # each filter's state with the other's output.
+            auto_chain = _AUTO_POINTER_TO_CT_CHAIN
+            auto_owns_output = (
+                auto_chain is not None
+                and auto_chain.is_actively_tracking()
+                and auto_chain._pointer_to_ct_node is self._needle_transform_node
+            )
+            if not auto_owns_output:
+                # Low-pass filter the displayed tool pose so tracker jitter
+                # does not make the needle model / reslice views shake.
+                # No-op when smoothing is disabled.
+                pointer_to_ct = self._stabilizer.smooth_matrix(pointer_to_ct)
+                self._needle_transform_node.SetMatrixTransformToParent(pointer_to_ct)
+
+            if self._needle_model_node is not None:
+                # The model is normally parented to the NeedleModelToPointer
+                # correction node, whose parent is the needle transform —
+                # that indirect attachment is CORRECT and must not be
+                # "fixed" here (reparenting directly would silently drop the
+                # 90-degree model correction).
+                current_id = self._needle_model_node.GetTransformNodeID() or ""
+                needle_id = self._needle_transform_node.GetID()
+                attached = current_id == needle_id
+                if not attached and current_id:
+                    try:
+                        parent = slicer.mrmlScene.GetNodeByID(current_id)
+                        attached = (
+                            parent is not None
+                            and parent.GetTransformNodeID() == needle_id
+                        )
+                    except Exception:
+                        attached = False
+                if not attached:
+                    self._needle_model_node.SetAndObserveTransformNodeID(needle_id)
+            if self._ct_volume_node is not None and self._ct_volume_node.GetTransformNodeID():
+                self._clear_parent_transform(self._ct_volume_node)
+
+            if (
+                self._needle_transform_observed_node is None
+                or self._needle_transform_observed_node.GetID() != self._needle_transform_node.GetID()
+            ):
+                self._observe_needle_transform(self._needle_transform_node)
+        finally:
+            self._updating_tracking_pipeline = False
+
+    def _configure_tracking_visualization(self):
+        if self._needle_transform_node is None:
+            return
+        self._ensure_needle_model_correction_node()
+        self._attach_needle_model_to_tracking_chain()
+        _ensure_intersecting_slices_visible()
+        if self._ct_volume_node is not None and self._ct_volume_node.GetTransformNodeID():
+            self._clear_parent_transform(self._ct_volume_node)
+
+        if self._ct_volume_node is None or not hasattr(slicer.modules, "volumereslicedriver"):
+            return
+
+        try:
+            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        except Exception:
+            pass
+        try:
+            slicer.util.setSliceViewerLayers(background=self._ct_volume_node)
+        except Exception:
+            pass
+
+        reslice_logic = slicer.modules.volumereslicedriver.logic()
+        if reslice_logic is None:
+            return
+
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+
+        mode_map = _slice_driver_mode_map_for_tracking_view_mode(self._tracking_view_mode)
+
+        should_drive_slices = bool(
+            self._tracking_active and self._tracking_view_mode in ("tool_centric", "scan_centric", "tool_dynamic")
+        )
+        for view_name, mode in mode_map:
+            try:
+                slice_widget = layout_manager.sliceWidget(view_name)
+                if slice_widget is None:
+                    continue
+                slice_node = slice_widget.mrmlSliceNode()
+                if slice_node is None:
+                    continue
+                if should_drive_slices:
+                    reslice_logic.SetDriverForSlice(self._needle_transform_node.GetID(), slice_node)
+                    reslice_logic.SetModeForSlice(int(mode), slice_node)
+                else:
+                    reslice_logic.SetDriverForSlice("", slice_node)
+            except Exception:
+                continue
+
+        if should_drive_slices:
+            self._jump_slices_to_transform_position(self._needle_transform_node)
+            if self._tracking_view_mode == "scan_centric":
+                self._apply_scan_centric_slice_zoom(layout_manager)
+                self._disable_tool_dynamic_view()
+            else:
+                self._restore_scan_centric_slice_zoom(layout_manager)
+            if self._tracking_view_mode == "tool_dynamic" and self._tracking_active:
+                self._enable_tool_dynamic_view()
+            elif self._tracking_view_mode != "scan_centric":
+                self._disable_tool_dynamic_view()
+        else:
+            if self._tracking_view_mode != "scan_centric":
+                self._restore_scan_centric_slice_zoom(layout_manager)
+            self._disable_tool_dynamic_view()
+            try:
+                slicer.util.resetSliceViews()
+            except Exception:
+                pass
+
+    def apply_registration(
+        self,
+        matrix_path: str,
+        invert: bool,
+        ct_transform_name: str,
+        ct_volume_node=None,
+    ):
+        if not os.path.isfile(matrix_path):
+            raise RuntimeError("Registration matrix file not found")
+
+        self._status("registration", _StatusState.WAIT, "Loading registration matrix…")
+        slicer.app.processEvents()
+
+        matrix = self._read_registration_matrix(matrix_path)
+        if invert:
+            det = matrix.Determinant()
+            if abs(det) < 1e-12:
+                raise RuntimeError("Registration matrix is singular (cannot invert)")
+            inv = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(matrix, inv)
+            matrix = inv
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=ct_transform_name,
+            pointer_to_ct_name=(
+                self._needle_transform_node.GetName() if self._needle_transform_node is not None else _DEFAULT_POINTER_TO_CT_NAME
+            ),
+        )
+        ct_transform = self._reference_to_ct_node
+        try:
+            ct_transform.SetMatrixTransformToParent(matrix)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply registration transform: {exc}")
+        self._set_registration_metadata(
+            ct_transform,
+            method="matrix-file",
+            source=os.path.basename(matrix_path),
+            rmse_mm=None,
+        )
+        self._ct_transform_node = ct_transform
+        self._reference_to_ct_node = ct_transform
+        self._registration_loaded = True
+        self._registration_loaded_from = os.path.basename(matrix_path)
+        self._observe_navigation_pipeline_inputs()
+        self._update_navigation_pipeline()
+
+        volume = ct_volume_node or self._ct_volume_node or self._find_best_scalar_volume_in_scene()
+        if volume is None:
+            self._status(
+                "registration",
+                _StatusState.OK,
+                f"Registration loaded: {os.path.basename(matrix_path)} (CT not loaded yet)",
+            )
+            return
+
+        self._clear_parent_transform(volume)
+        self._ct_volume_node = volume
+        self._status("registration", _StatusState.OK, f"Registration applied: {os.path.basename(matrix_path)}")
+        self._configure_tracking_visualization()
+        self._refit_views_after_registration(volume)
+
+    def _refit_views_after_registration(self, ct_volume_node):
+        if ct_volume_node is None:
+            return
+        try:
+            slicer.util.setSliceViewerLayers(background=ct_volume_node)
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+        try:
+            if self._vr_display_node is not None:
+                vr_logic = slicer.modules.volumerendering.logic()
+                if vr_logic is not None:
+                    try:
+                        self._vr_display_node.SetCroppingEnabled(False)
+                    except Exception:
+                        pass
+                    vr_logic.FitROIToVolume(self._vr_display_node)
+                    try:
+                        roi_node = self._vr_display_node.GetROINode()
+                        if roi_node is not None:
+                            roi_display = roi_node.GetDisplayNode() if hasattr(roi_node, "GetDisplayNode") else None
+                            if roi_display is not None:
+                                roi_display.SetVisibility(False)
+                            elif hasattr(roi_node, "SetDisplayVisibility"):
+                                roi_node.SetDisplayVisibility(False)
+                    except Exception:
+                        pass
+            slicer.app.processEvents()
+            slicer.util.resetThreeDViews()
+        except Exception:
+            pass
+
+    def _remove_previous_ct_nodes(self):
+        """Remove the previously loaded CT (volume node + its volume-rendering
+        nodes) from the scene.
+
+        Without this, loading a CT a second time leaves the first volume and its
+        volume-rendering display still visible, so the new image renders on top
+        of the old one instead of replacing it. Called before each CT load.
+        """
+        # Grab the helper ROI / volume-property nodes referenced by the tracked
+        # VR display node before we drop our reference to it.
+        vr_display_node = self._vr_display_node
+        nodes_to_remove = []
+        if vr_display_node is not None:
+            try:
+                nodes_to_remove.append(vr_display_node.GetROINode())
+            except Exception:
+                pass
+            try:
+                nodes_to_remove.append(vr_display_node.GetVolumePropertyNode())
+            except Exception:
+                pass
+        self._vr_display_node = None
+
+        ct_volume_node = self._ct_volume_node
+        self._ct_volume_node = None
+        if ct_volume_node is not None:
+            # Remove every display node attached to the old volume (scalar
+            # display + volume-rendering display), then the volume itself.
+            try:
+                for i in range(ct_volume_node.GetNumberOfDisplayNodes()):
+                    nodes_to_remove.append(ct_volume_node.GetNthDisplayNode(i))
+            except Exception:
+                pass
+            nodes_to_remove.append(ct_volume_node)
+
+        for node in nodes_to_remove:
+            if node is None:
+                continue
+            try:
+                slicer.mrmlScene.RemoveNode(node)
+            except Exception:
+                pass
+
+    def load_ct(self, dicom_folder: str, ct_transform_name: str):
+        if not os.path.isdir(dicom_folder):
+            raise RuntimeError("DICOM folder not found")
+
+        self._status("ct", _StatusState.WAIT, "Loading CT from DICOM…")
+        slicer.app.processEvents()
+
+        # Remove any previously loaded CT (volume + volume-rendering nodes) so a
+        # re-load replaces the old image instead of stacking a second volume on
+        # top of the first one in the 3D / slice views.
+        self._remove_previous_ct_nodes()
+
+        ct_volume = self._load_best_ct_volume_from_dicom_folder(dicom_folder)
+        if ct_volume is None:
+            raise RuntimeError("No CT volume could be loaded from the selected DICOM folder")
+        self._ct_volume_node = ct_volume
+        self._status("ct", _StatusState.OK, f"CT loaded: {ct_volume.GetName()}")
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=ct_transform_name,
+            pointer_to_ct_name=(
+                self._needle_transform_node.GetName() if self._needle_transform_node is not None else _DEFAULT_POINTER_TO_CT_NAME
+            ),
+        )
+        self._clear_parent_transform(ct_volume)
+        self._ct_transform_node = self._reference_to_ct_node
+        if self._registration_loaded and self._registration_loaded_from:
+            self._status("registration", _StatusState.OK, f"Registration applied: {self._registration_loaded_from}")
+
+        # Show CT in slice views and set a navigation-friendly layout
+        try:
+            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        except Exception:
+            pass
+        try:
+            slicer.util.setSliceViewerLayers(background=ct_volume)
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+
+        self._status("vr", _StatusState.WAIT, "Enabling volume rendering…")
+        slicer.app.processEvents()
+
+        vr_logic = slicer.modules.volumerendering.logic()
+        if vr_logic is None:
+            raise RuntimeError("VolumeRendering module is not available")
+
+        vr_display_node = vr_logic.CreateDefaultVolumeRenderingNodes(ct_volume)
+        try:
+            vr_display_node.SetCroppingEnabled(False)
+        except Exception:
+            pass
+        vr_logic.SetRecommendedVolumeRenderingProperties(vr_display_node)
+        vr_logic.FitROIToVolume(vr_display_node)
+        vr_display_node.SetVisibility(True)
+        self._vr_display_node = vr_display_node
+        self._status("vr", _StatusState.OK, "Volume rendering enabled")
+
+        try:
+            roi_node = vr_display_node.GetROINode()
+            if roi_node is not None:
+                roi_display = roi_node.GetDisplayNode() if hasattr(roi_node, "GetDisplayNode") else None
+                if roi_display is not None:
+                    roi_display.SetVisibility(False)
+                elif hasattr(roi_node, "SetDisplayVisibility"):
+                    roi_node.SetDisplayVisibility(False)
+        except Exception:
+            pass
+
+        try:
+            slicer.util.resetThreeDViews()
+        except Exception:
+            pass
+        self._configure_tracking_visualization()
+
+    def load_needle(self, needle_path: str, needle_transform_name: str):
+        if not os.path.isfile(needle_path):
+            raise RuntimeError("Needle STL not found")
+
+        self._status("needle", _StatusState.WAIT, "Loading needle STL…")
+        slicer.app.processEvents()
+
+        # returnNode was removed from slicer.util loaders in Slicer 5.x
+        # (loadModel now returns the node directly) — try the legacy call
+        # first and fall back so both API generations work.
+        try:
+            success, model_node = slicer.util.loadModel(needle_path, returnNode=True)
+        except TypeError:
+            model_node = slicer.util.loadModel(needle_path)
+            success = model_node is not None
+        if not success or model_node is None:
+            raise RuntimeError("Failed to load needle STL")
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=(
+                self._reference_to_ct_node.GetName() if self._reference_to_ct_node is not None else _DEFAULT_REFERENCE_TO_CT_NAME
+            ),
+            pointer_to_ct_name=needle_transform_name,
+        )
+        self._needle_model_node = model_node
+        self._configure_needle_model_display(model_node)
+        self._attach_needle_model_to_tracking_chain(model_node)
+        self._status("needle", _StatusState.OK, f"Needle loaded: {model_node.GetName()}")
+        self._configure_tracking_visualization()
+
+    def initialize_tracking(
+        self,
+        igtl_host: str,
+        igtl_port: int,
+        ct_transform_name: str,
+        needle_transform_name: str,
+        expected_transform_names: Optional[list[str]] = None,
+        launcher_host: Optional[str] = None,
+        launcher_port: Optional[int] = None,
+        plus_config_path: str = "",
+        plus_exe_path: str = "",
+        phantom_geometry_path: str = "",
+        tool_geometry_path: str = "",
+    ):
+        # Switch to "external PLUS" mode: disable any ongoing PlusRemote polling to avoid
+        # OpenIGTLink command spam and transform parenting conflicts.
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        self._plus_started_locally = False
+        self._set_phase("idle")
+        self._expected_transform_names = list(expected_transform_names or [])
+        normalized_igtl_host = str(igtl_host).strip() or "localhost"
+        normalized_plus_config = str(plus_config_path or "").strip()
+
+        # Internal PlusServer mode: launch subprocess if geometry and exe are provided
+        use_internal = bool(plus_exe_path and phantom_geometry_path and tool_geometry_path)
+
+        try:
+            connector = self._connect_openigtlink_client(normalized_igtl_host, int(igtl_port))
+            self._status("launcher", _StatusState.OK, f"IGTL connected ({normalized_igtl_host}:{int(igtl_port)})")
+            self._status("server", _StatusState.OK, "PLUS running externally")
+        except Exception as openigtlink_error:
+            if use_internal:
+                self._status("launcher", _StatusState.WAIT, "Launching internal PlusServer...")
+                slicer.app.processEvents()
+                try:
+                    self._params = WorkflowParams(
+                        dicom_folder="",
+                        needle_stl_path="",
+                        plus_config_path=normalized_plus_config,
+                        registration_matrix_path="",
+                        launcher_host="localhost",
+                        launcher_port=18904,
+                        plus_exe_path=plus_exe_path,
+                        phantom_geometry_path=phantom_geometry_path,
+                        tool_geometry_path=tool_geometry_path,
+                        plus_mode="internal",
+                    )
+                    self._start_internal_plus()
+                    self._expected_transform_names = ["PointerToPhantom", "PointerToTracker", "PhantomToTracker", "PhantomToPointer"]
+                    connector = self._igtl_connector_node
+                except Exception as internal_error:
+                    raise RuntimeError(
+                        f"{openigtlink_error}. Internal PlusServer startup also failed: {internal_error}. "
+                        "Confirm the tracker/camera hardware is available and the geometry files are correct."
+                    ) from internal_error
+                self._status("launcher", _StatusState.OK, f"IGTL connected (localhost:{int(igtl_port)})")
+                self._status("server", _StatusState.OK, "PlusServer running (internal)")
+            elif normalized_plus_config:
+                normalized_launcher_host = str(launcher_host or "").strip() or "localhost"
+                normalized_launcher_port = int(launcher_port or 18904)
+                self._status(
+                    "launcher",
+                    _StatusState.WAIT,
+                    f"Tracker stream unavailable at {normalized_igtl_host}:{int(igtl_port)}. Starting local PLUS...",
+                )
+                slicer.app.processEvents()
+                try:
+                    self._start_local_plus_for_tracking(
+                        launcher_host=normalized_launcher_host,
+                        launcher_port=normalized_launcher_port,
+                        plus_config_path=normalized_plus_config,
+                        ct_transform_name=ct_transform_name,
+                        needle_transform_name=needle_transform_name,
+                        expected_transform_names=expected_transform_names,
+                    )
+                    connector = self._connect_openigtlink_client(normalized_igtl_host, int(igtl_port))
+                except Exception as local_plus_error:
+                    raise RuntimeError(
+                        f"{openigtlink_error}. Local PLUS startup also failed: {local_plus_error}. "
+                        "Confirm the tracker/camera hardware is available and the Workspace Settings endpoints are correct."
+                    ) from local_plus_error
+                self._status("launcher", _StatusState.OK, f"IGTL connected ({normalized_igtl_host}:{int(igtl_port)})")
+                self._status("server", _StatusState.OK, "PLUS running locally")
+            else:
+                raise RuntimeError(
+                    f"{openigtlink_error}. Init Tracking connects to an OpenIGTLink tracker stream, not a webcam. "
+                    "Start PLUS/the tracker server first, or configure Workspace Settings and use Start Navigate."
+                ) from openigtlink_error
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=ct_transform_name,
+            pointer_to_ct_name=needle_transform_name,
+        )
+        self._register_connector_for_navigation_streams(connector, expected_transform_names)
+        self._observe_navigation_pipeline_inputs()
+        self._update_navigation_pipeline()
+        self._configure_tracking_visualization()
+
+        self._tracking_active = False
+        self._last_needle_matrix = None
+        self._observe_needle_transform(self._needle_transform_node)
+        self._status(
+            "transforms",
+            _StatusState.OK,
+            "Pipeline ready: live pointer stream -> reference frame -> CT -> PointerToCT",
+        )
+        self._status("tracking", _StatusState.WAIT, "Waiting for motion...")
+        # (An unreachable duplicate of the connection logic that previously
+        # followed this return has been removed.)
+
+    def _disconnect_openigtlink(self):
+        """Stop and remove the OpenIGTLink connector node from the scene."""
+        if self._igtl_connector_node is not None:
+            try:
+                self._igtl_connector_node.Stop()
+            except Exception:
+                pass
+            try:
+                slicer.mrmlScene.RemoveNode(self._igtl_connector_node)
+            except Exception:
+                pass
+            self._igtl_connector_node = None
+        # Also clean up any orphaned connectors from prior sessions
+        while True:
+            orphan = slicer.util.getFirstNodeByClassByName("vtkMRMLIGTLConnectorNode", "SpineTracker2_OpenIGTLink")
+            if orphan is None:
+                break
+            try:
+                orphan.Stop()
+                slicer.mrmlScene.RemoveNode(orphan)
+            except Exception:
+                break
+
+    def _connect_openigtlink_client(self, igtl_host: str, igtl_port: int):
+        normalized_igtl_host = str(igtl_host).strip() or "localhost"
+        normalized_igtl_port = int(igtl_port)
+
+        self._status("launcher", _StatusState.WAIT, f"Connecting to OpenIGTLink ({normalized_igtl_host}:{normalized_igtl_port})...")
+        slicer.app.processEvents()
+
+        # Remove any stale connector first
+        self._disconnect_openigtlink()
+
+        connector_name = "SpineTracker2_OpenIGTLink"
+        connector = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLIGTLConnectorNode", connector_name)
+        connector.SetTypeClient(normalized_igtl_host, normalized_igtl_port)
+        connector.Start()
+        self._igtl_connector_node = connector
+
+        started_at = time.time()
+        while connector.GetState() != slicer.vtkMRMLIGTLConnectorNode.StateConnected:
+            if time.time() - started_at > float(self._timeout_igtl_connect_s):
+                raise RuntimeError(f"Could not connect to OpenIGTLink server at {normalized_igtl_host}:{normalized_igtl_port}")
+            slicer.app.processEvents()
+            time.sleep(0.05)
+
+        return connector
+
+    def _start_local_plus_for_tracking(
+        self,
+        launcher_host: str,
+        launcher_port: int,
+        plus_config_path: str,
+        ct_transform_name: str,
+        needle_transform_name: str,
+        expected_transform_names: Optional[list[str]] = None,
+    ):
+        normalized_plus_config = str(plus_config_path or "").strip()
+        if not normalized_plus_config:
+            raise RuntimeError("No PLUS config XML is configured")
+        if not os.path.isfile(normalized_plus_config):
+            raise RuntimeError(f"PLUS config XML not found: {normalized_plus_config}")
+
+        normalized_launcher_host = str(launcher_host).strip() or "localhost"
+        normalized_launcher_port = int(launcher_port)
+        self._params = WorkflowParams(
+            dicom_folder="",
+            needle_stl_path="",
+            plus_config_path=normalized_plus_config,
+            registration_matrix_path="",
+            launcher_host=normalized_launcher_host,
+            launcher_port=normalized_launcher_port,
+            invert_registration_matrix=False,
+            ct_transform_name=ct_transform_name,
+            needle_transform_name=needle_transform_name,
+        )
+        self._expected_transform_names = list(
+            expected_transform_names or self._parse_transform_names_from_plus_config_path(normalized_plus_config)
+        )
+        self._plus_started_locally = True
+
+        self._status(
+            "launcher",
+            _StatusState.WAIT,
+            f"Connecting to PlusServerLauncher ({normalized_launcher_host}:{normalized_launcher_port})...",
+        )
+        self._status("server", _StatusState.WAIT, "Starting PLUS server...")
+        slicer.app.processEvents()
+
+        try:
+            self._ensure_plus_remote_available()
+            self._setup_plus_nodes()
+
+            started_at = time.time()
+            while True:
+                if self._plus_remote_logic is not None and self._launcher_node is not None:
+                    self._plus_remote_logic.UpdateLauncher(self._launcher_node)
+                if self._plus_remote_logic is not None and self._server_node is not None:
+                    self._plus_remote_logic.UpdateServer(self._server_node)
+
+                launcher_connected = self._is_launcher_connected()
+                server_on = self._is_server_on()
+
+                if launcher_connected:
+                    self._status(
+                        "launcher",
+                        _StatusState.OK,
+                        f"Launcher connected ({normalized_launcher_host}:{normalized_launcher_port})",
+                    )
+                elif time.time() - started_at > float(self._timeout_connect_s):
+                    raise RuntimeError(
+                        f"Could not connect to PlusServerLauncher at {normalized_launcher_host}:{normalized_launcher_port}"
+                    )
+                else:
+                    self._status(
+                        "launcher",
+                        _StatusState.WAIT,
+                        f"Connecting to PlusServerLauncher ({normalized_launcher_host}:{normalized_launcher_port})...",
+                    )
+
+                if server_on:
+                    self._status("server", _StatusState.OK, "PLUS server started")
+                elif time.time() - started_at > float(self._timeout_server_s):
+                    raise RuntimeError(f"PLUS server did not start within {int(self._timeout_server_s)}s")
+                else:
+                    self._status("server", _StatusState.WAIT, f"Starting PLUS server ({self._server_state_string()})...")
+
+                if launcher_connected and server_on:
+                    break
+
+                slicer.app.processEvents()
+                time.sleep(0.1)
+        except Exception:
+            try:
+                if self._server_node is not None:
+                    self._server_node.SetControlledLocally(True)
+                    self._server_node.StopServer()
+            except Exception:
+                pass
+            try:
+                if self._server_node is not None:
+                    for connector in self._server_node.GetPlusOpenIGTLinkConnectorNodes():
+                        if connector is not None:
+                            connector.Stop()
+            except Exception:
+                pass
+            self._plus_started_locally = False
+            raise
+
+    def _find_best_scalar_volume_in_scene(self):
+        volume_nodes = []
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            if node is not None:
+                volume_nodes.append(node)
+        if not volume_nodes:
+            return None
+        if len(volume_nodes) == 1:
+            return volume_nodes[0]
+
+        def voxel_count(volume_node) -> int:
+            image = volume_node.GetImageData()
+            if image is None:
+                return 0
+            dims = image.GetDimensions()
+            return int(dims[0]) * int(dims[1]) * int(dims[2])
+
+        volume_nodes.sort(key=voxel_count, reverse=True)
+        return volume_nodes[0]
+
+    def _apply_registration_to_ct(self, ct_volume_node):
+        assert self._params is not None
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=self._params.ct_transform_name,
+            pointer_to_ct_name=self._params.needle_transform_name,
+        )
+        self._ct_transform_node = self._reference_to_ct_node
+        self._clear_parent_transform(ct_volume_node)
+
+        matrix_path = (self._params.registration_matrix_path or "").strip()
+        if not matrix_path:
+            self._status("registration", _StatusState.WAIT, "Registration: not applied")
+            self._observe_navigation_pipeline_inputs()
+            self._update_navigation_pipeline()
+            self._configure_tracking_visualization()
+            return
+
+        self.apply_registration(
+            matrix_path=matrix_path,
+            invert=bool(self._params.invert_registration_matrix),
+            ct_transform_name=self._params.ct_transform_name,
+            ct_volume_node=ct_volume_node,
+        )
+
+    def _read_registration_matrix(self, path: str) -> vtk.vtkMatrix4x4:
+        values: list[float] = []
+        with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+            for line_no, line in enumerate(fp, start=1):
+                s = line.strip()
+                if not s or s.lstrip().startswith("#"):
+                    continue
+                matches = _FLOAT_RE.findall(s)
+                if not matches:
+                    continue
+                try:
+                    values.extend(float(m) for m in matches)
+                except ValueError as exc:
+                    raise RuntimeError(f"Invalid number on line {line_no}") from exc
+        if len(values) != 16:
+            raise RuntimeError(f"Expected 16 numbers in registration matrix, got {len(values)}")
+        matrix = vtk.vtkMatrix4x4()
+        idx = 0
+        for r in range(4):
+            for c in range(4):
+                matrix.SetElement(r, c, values[idx])
+                idx += 1
+        return matrix
+
+    def _read_registration_matrix_from_text(self, text: str) -> vtk.vtkMatrix4x4:
+        values: list[float] = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            s = line.strip()
+            if not s or s.lstrip().startswith("#"):
+                continue
+            matches = _FLOAT_RE.findall(s)
+            if not matches:
+                continue
+            try:
+                values.extend(float(m) for m in matches)
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid number on line {line_no}") from exc
+        if len(values) != 16:
+            raise RuntimeError(f"Expected 16 numbers in registration matrix, got {len(values)}")
+        matrix = vtk.vtkMatrix4x4()
+        idx = 0
+        for r in range(4):
+            for c in range(4):
+                matrix.SetElement(r, c, values[idx])
+                idx += 1
+        return matrix
+
+    def apply_registration_text(
+        self,
+        matrix_text: str,
+        invert: bool,
+        ct_transform_name: str,
+        ct_volume_node=None,
+    ):
+        if not (matrix_text or "").strip():
+            raise RuntimeError("Registration matrix text is empty")
+
+        self._status("registration", _StatusState.WAIT, "Loading registration matrix…")
+        slicer.app.processEvents()
+
+        matrix = self._read_registration_matrix_from_text(matrix_text)
+        if invert:
+            det = matrix.Determinant()
+            if abs(det) < 1e-12:
+                raise RuntimeError("Registration matrix is singular (cannot invert)")
+            inv = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(matrix, inv)
+            matrix = inv
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=ct_transform_name,
+            pointer_to_ct_name=(
+                self._needle_transform_node.GetName() if self._needle_transform_node is not None else _DEFAULT_POINTER_TO_CT_NAME
+            ),
+        )
+        ct_transform = self._reference_to_ct_node
+        try:
+            ct_transform.SetMatrixTransformToParent(matrix)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply registration transform: {exc}")
+        self._set_registration_metadata(
+            ct_transform,
+            method="matrix-text",
+            source="pasted matrix",
+            rmse_mm=None,
+        )
+        self._ct_transform_node = ct_transform
+        self._reference_to_ct_node = ct_transform
+        self._registration_loaded = True
+        self._registration_loaded_from = "pasted"
+        self._observe_navigation_pipeline_inputs()
+        self._update_navigation_pipeline()
+
+        volume = ct_volume_node or self._ct_volume_node or self._find_best_scalar_volume_in_scene()
+        if volume is None:
+            self._status("registration", _StatusState.OK, "Registration loaded: pasted (CT not loaded yet)")
+            return
+
+        self._clear_parent_transform(volume)
+        self._ct_volume_node = volume
+        self._status("registration", _StatusState.OK, "Registration applied: pasted")
+        self._configure_tracking_visualization()
+        self._refit_views_after_registration(volume)
+
+    def _load_ct_and_enable_vr(self):
+        assert self._params is not None
+
+        dicom_folder = self._params.dicom_folder
+        if not os.path.isdir(dicom_folder):
+            raise RuntimeError("DICOM folder not found")
+
+        self._status("ct", _StatusState.WAIT, "Loading CT from DICOM…")
+        slicer.app.processEvents()
+
+        # Remove any previously loaded CT (volume + volume-rendering nodes) so a
+        # re-load replaces the old image instead of stacking a second volume on
+        # top of the first one in the 3D / slice views.
+        self._remove_previous_ct_nodes()
+
+        ct_volume = self._load_best_ct_volume_from_dicom_folder(dicom_folder)
+        if ct_volume is None:
+            raise RuntimeError("No CT volume could be loaded from the selected DICOM folder")
+        self._ct_volume_node = ct_volume
+        self._status("ct", _StatusState.OK, f"CT loaded: {ct_volume.GetName()}")
+
+        self._apply_registration_to_ct(ct_volume)
+
+        # Show CT in slice views and set a navigation-friendly layout
+        try:
+            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        except Exception:
+            pass
+        try:
+            slicer.util.setSliceViewerLayers(background=ct_volume)
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+
+        self._status("vr", _StatusState.WAIT, "Enabling volume rendering…")
+        slicer.app.processEvents()
+
+        vr_logic = slicer.modules.volumerendering.logic()
+        if vr_logic is None:
+            raise RuntimeError("VolumeRendering module is not available")
+
+        vr_display_node = vr_logic.CreateDefaultVolumeRenderingNodes(ct_volume)
+        vr_logic.SetRecommendedVolumeRenderingProperties(vr_display_node)
+        vr_logic.FitROIToVolume(vr_display_node)
+        vr_display_node.SetVisibility(True)
+        self._vr_display_node = vr_display_node
+        self._status("vr", _StatusState.OK, "Volume rendering enabled")
+
+        try:
+            slicer.util.resetThreeDViews()
+        except Exception:
+            pass
+
+    def _load_best_ct_volume_from_dicom_folder(self, folder: str):
+        from DICOMLib import DICOMUtils
+
+        loaded_node_ids: list[str] = []
+        with DICOMUtils.TemporaryDICOMDatabase() as db:
+            DICOMUtils.importDicom(folder, db)
+            patient_uids = db.patients()
+            if not patient_uids:
+                return None
+            loaded_node_ids.extend(DICOMUtils.loadPatientByUID(patient_uids[0]))
+
+        volume_nodes = []
+        for node_id in loaded_node_ids:
+            node = slicer.mrmlScene.GetNodeByID(node_id)
+            if node is None:
+                continue
+            if node.IsA("vtkMRMLScalarVolumeNode"):
+                volume_nodes.append(node)
+
+        if not volume_nodes:
+            return None
+        if len(volume_nodes) == 1:
+            return volume_nodes[0]
+
+        def voxel_count(volume_node) -> int:
+            image = volume_node.GetImageData()
+            if image is None:
+                return 0
+            dims = image.GetDimensions()
+            return int(dims[0]) * int(dims[1]) * int(dims[2])
+
+        volume_nodes.sort(key=voxel_count, reverse=True)
+        return volume_nodes[0]
+
+    def _load_needle_model(self):
+        assert self._params is not None
+
+        needle_path = self._params.needle_stl_path
+        if not os.path.isfile(needle_path):
+            raise RuntimeError("Needle STL not found")
+
+        self._status("needle", _StatusState.WAIT, "Loading needle STL…")
+        slicer.app.processEvents()
+
+        # returnNode was removed from slicer.util loaders in Slicer 5.x —
+        # legacy call first, modern fallback.
+        try:
+            success, model_node = slicer.util.loadModel(needle_path, returnNode=True)
+        except TypeError:
+            model_node = slicer.util.loadModel(needle_path)
+            success = model_node is not None
+        if not success or model_node is None:
+            raise RuntimeError("Failed to load needle STL")
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=self._params.ct_transform_name,
+            pointer_to_ct_name=self._params.needle_transform_name,
+        )
+        self._needle_model_node = model_node
+        self._configure_needle_model_display(model_node)
+        self._attach_needle_model_to_tracking_chain(model_node)
+        self._status("needle", _StatusState.OK, f"Needle loaded: {model_node.GetName()}")
+        self._configure_tracking_visualization()
+
+    def _attach_transforms_if_available(self):
+        assert self._params is not None
+
+        self._ensure_navigation_pipeline_nodes(
+            reference_to_ct_name=self._params.ct_transform_name,
+            pointer_to_ct_name=self._params.needle_transform_name,
+        )
+
+        selection = self._resolve_tracking_input_selection()
+        self._reference_to_ct_node = self._find_transform_node(self._params.ct_transform_name) or self._reference_to_ct_node
+        self._ct_transform_node = self._reference_to_ct_node
+        self._needle_transform_node = self._find_transform_node(self._params.needle_transform_name) or self._needle_transform_node
+
+        if selection is not None:
+            self._active_reference_frame_name = selection.reference_frame_name or "Reference"
+            self._pointer_to_tracker_node = selection.pointer_to_tracker_node
+            self._reference_to_tracker_node = selection.reference_to_tracker_node
+            self._pointer_to_reference_input_node = selection.pointer_to_reference_node
+            self._reference_to_pointer_input_node = selection.reference_to_pointer_node
+
+        inputs_ready = (
+            selection is not None
+            and self._reference_to_ct_node is not None
+            and self._needle_transform_node is not None
+        )
+        if inputs_ready:
+            self._observe_navigation_pipeline_inputs()
+            self._update_navigation_pipeline()
+            self._configure_tracking_visualization()
+
+        transforms_ready = inputs_ready
+        if transforms_ready:
+            self._status("transforms", _StatusState.OK, "Tracking pipeline ready")
+        else:
+            missing = []
+            if selection is None:
+                missing.extend([
+                    _LIVE_POINTER_TO_TRACKER_NAME,
+                    _LIVE_REFERENCE_TO_TRACKER_NAME,
+                    "PointerToPhantom",
+                    "PhantomToPointer",
+                    "PhantomToTracker",
+                ])
+            if self._reference_to_ct_node is None:
+                missing.append(self._params.ct_transform_name)
+            if self._needle_transform_node is None:
+                missing.append(self._params.needle_transform_name)
+            unique_missing = []
+            for name in missing:
+                if name not in unique_missing:
+                    unique_missing.append(name)
+            self._status("transforms", _StatusState.WAIT, "Waiting: " + ", ".join(unique_missing))
+
+        if self._tracking_active:
+            self._status("tracking", _StatusState.OK, "Tracking active")
+        else:
+            self._status("tracking", _StatusState.WAIT, "Waiting for motion…")
+
+    def _find_transform_node(self, name: str):
+        node = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", name)
+        if node is not None:
+            return node
+        # Fallback: scan all transforms by exact name
+        for tnode in slicer.util.getNodesByClass("vtkMRMLTransformNode"):
+            if tnode.GetName() == name:
+                return tnode
+        return None
+
+    def _observe_needle_transform(self, transform_node):
+        # Detach ONLY the previous needle observer here. This is called from
+        # _update_navigation_pipeline moments after the pipeline input
+        # observers were wired up — calling _remove_observers() (which also
+        # removes the pipeline input observers) left tracking with no
+        # event-driven updates at all.
+        self._remove_needle_transform_observer()
+
+        self._last_needle_matrix = self._matrix_to_list(transform_node)
+        self._last_follow_update_at_s = 0.0
+        self._needle_transform_observer_tag = transform_node.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self._on_needle_transform_modified
+        )
+        self._needle_transform_observed_node = transform_node
+
+    def _remove_needle_transform_observer(self):
+        if self._needle_transform_observed_node is not None and self._needle_transform_observer_tag is not None:
+            try:
+                self._needle_transform_observed_node.RemoveObserver(self._needle_transform_observer_tag)
+            except Exception:
+                pass
+        self._needle_transform_observer_tag = None
+        self._needle_transform_observed_node = None
+
+    def _remove_observers(self):
+        self._remove_pipeline_observers()
+        self._remove_needle_transform_observer()
+
+    def _on_needle_transform_modified(self, caller, _event_id):
+        try:
+            current = self._matrix_to_list(caller)
+        except Exception:
+            return
+        if self._last_needle_matrix is None:
+            self._last_needle_matrix = current
+            return
+
+        moved = any(abs(current[i] - self._last_needle_matrix[i]) > 1e-6 for i in range(16))
+        if moved and not self._tracking_active:
+            self._tracking_active = True
+            self._status("tracking", _StatusState.OK, "Tracking active")
+            self._configure_tracking_visualization()
+
+        self._last_needle_matrix = current
+        self._maybe_follow_tool(current)
+
+    def _maybe_follow_tool(self, matrix_list: list[float]):
+        now = time.time()
+        if now - self._last_follow_update_at_s < 0.1:
+            return
+        self._last_follow_update_at_s = now
+
+        if len(matrix_list) != 16:
+            return
+
+        x = float(matrix_list[3])
+        y = float(matrix_list[7])
+        z = float(matrix_list[11])
+
+        try:
+            crosshair = self._get_or_create_crosshair_node()
+            if crosshair is not None:
+                crosshair.SetCrosshairRAS([x, y, z])
+                crosshair.SetCrosshairMode(slicer.vtkMRMLCrosshairNode.ShowBasic)
+        except Exception:
+            pass
+
+        if (
+            self._tracking_view_mode in ("tool_centric", "scan_centric", "tool_dynamic")
+            and not self._volume_reslice_driver_is_driving_slices()
+        ):
+            self._jump_slices_to_position(x, y, z)
+
+    def _jump_slices_to_position(self, x: float, y: float, z: float):
+        try:
+            slicer.vtkMRMLSliceNode.JumpAllSlices(
+                slicer.mrmlScene,
+                x,
+                y,
+                z,
+                slicer.vtkMRMLSliceNode.CenteredJumpSlice,
+            )
+        except Exception:
+            pass
+
+    def _jump_slices_to_transform_position(self, transform_node):
+        if transform_node is None:
+            return
+        try:
+            matrix_list = self._matrix_to_list(transform_node)
+        except Exception:
+            return
+        if len(matrix_list) != 16:
+            return
+        self._jump_slices_to_position(
+            float(matrix_list[3]),
+            float(matrix_list[7]),
+            float(matrix_list[11]),
+        )
+
+    def _apply_scan_centric_slice_zoom(self, layout_manager):
+        if layout_manager is None:
+            return
+
+        current_volume_id = self._ct_volume_node.GetID() if self._ct_volume_node is not None else ""
+        refresh_zoom_baseline = (
+            not self._scan_centric_zoom_active
+            or not self._scan_centric_base_fovs
+            or self._scan_centric_zoom_volume_id != current_volume_id
+        )
+        if refresh_zoom_baseline:
+            # Keep the original pre-zoom FOVs when zoom is already active
+            # (e.g. a new volume loaded mid-zoom): re-capturing here would
+            # store the currently ZOOMED view as the "restore" state, so
+            # leaving scan-centric mode would restore a zoomed FOV instead
+            # of the user's original view.
+            if not self._scan_centric_zoom_active:
+                self._scan_centric_restore_fovs = {}
+            self._scan_centric_base_fovs = {}
+
+        for view_name in ("Red", "Yellow", "Green"):
+            try:
+                slice_widget = layout_manager.sliceWidget(view_name)
+            except Exception:
+                slice_widget = None
+            if slice_widget is None:
+                continue
+
+            slice_node = slice_widget.mrmlSliceNode() if hasattr(slice_widget, "mrmlSliceNode") else None
+            if slice_node is None:
+                continue
+
+            if refresh_zoom_baseline:
+                # Only capture a restore FOV the first time (see note above).
+                if view_name not in self._scan_centric_restore_fovs:
+                    current_fov = _slice_node_field_of_view(slice_node)
+                    if current_fov is not None:
+                        self._scan_centric_restore_fovs[view_name] = current_fov
+
+                slice_logic = slice_widget.sliceLogic() if hasattr(slice_widget, "sliceLogic") else None
+                if slice_logic is not None:
+                    try:
+                        slice_logic.FitSliceToBackground()
+                    except Exception:
+                        pass
+
+                fitted_fov = _slice_node_field_of_view(slice_node)
+                if fitted_fov is not None:
+                    self._scan_centric_base_fovs[view_name] = fitted_fov
+
+            base_fov = self._scan_centric_base_fovs.get(view_name)
+            if base_fov is None:
+                continue
+
+            _set_slice_node_field_of_view(slice_node, _scan_centric_zoomed_fov(base_fov))
+
+        self._scan_centric_zoom_active = True
+        self._scan_centric_zoom_volume_id = current_volume_id
+
+    def _restore_scan_centric_slice_zoom(self, layout_manager):
+        if not self._scan_centric_zoom_active:
+            return
+
+        if layout_manager is not None:
+            for view_name, fov in self._scan_centric_restore_fovs.items():
+                try:
+                    slice_widget = layout_manager.sliceWidget(view_name)
+                except Exception:
+                    slice_widget = None
+                if slice_widget is None:
+                    continue
+                slice_node = slice_widget.mrmlSliceNode() if hasattr(slice_widget, "mrmlSliceNode") else None
+                if slice_node is None:
+                    continue
+                _set_slice_node_field_of_view(slice_node, fov)
+
+        self._scan_centric_zoom_active = False
+        self._scan_centric_restore_fovs = {}
+        self._scan_centric_base_fovs = {}
+        self._scan_centric_zoom_volume_id = ""
+
+    def _set_slice_node_orientation(self, slice_node, orientation_name: str):
+        if slice_node is None:
+            return
+        try:
+            slice_node.SetOrientation(str(orientation_name))
+            return
+        except Exception:
+            pass
+        method = getattr(slice_node, f"SetOrientationTo{orientation_name}", None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+
+    def _restore_scan_centric_views(self, transform_node=None):
+        try:
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+
+        try:
+            layout_manager = slicer.app.layoutManager()
+        except Exception:
+            layout_manager = None
+        if layout_manager is not None:
+            for view_name, orientation_name in (
+                ("Red", "Axial"),
+                ("Yellow", "Sagittal"),
+                ("Green", "Coronal"),
+            ):
+                try:
+                    slice_widget = layout_manager.sliceWidget(view_name)
+                    if slice_widget is None:
+                        continue
+                    slice_node = slice_widget.mrmlSliceNode()
+                    if slice_node is None:
+                        continue
+                    self._set_slice_node_orientation(slice_node, orientation_name)
+                except Exception:
+                    continue
+
+        if transform_node is not None:
+            self._jump_slices_to_transform_position(transform_node)
+
+    def _get_primary_3d_view_node(self):
+        try:
+            layout_manager = slicer.app.layoutManager()
+        except Exception:
+            layout_manager = None
+        if layout_manager is None or layout_manager.threeDViewCount < 1:
+            return None
+        try:
+            three_d_widget = layout_manager.threeDWidget(0)
+        except Exception:
+            three_d_widget = None
+        if three_d_widget is None:
+            return None
+        try:
+            three_d_view = three_d_widget.threeDView()
+        except Exception:
+            three_d_view = None
+        if three_d_view is None:
+            return None
+        try:
+            return three_d_view.mrmlViewNode()
+        except Exception:
+            return None
+
+    def _disable_tool_dynamic_view(self):
+        viewpoint_instance = self._viewpoint_instance
+        if viewpoint_instance is None:
+            return
+        try:
+            if viewpoint_instance.isCurrentModeBullseye():
+                viewpoint_instance.bullseyeStop()
+        except Exception:
+            pass
+
+    def _enable_tool_dynamic_view(self):
+        if self._needle_transform_node is None:
+            self._disable_tool_dynamic_view()
+            return
+
+        try:
+            viewpoint_module = importlib.import_module("Viewpoint")
+        except Exception:
+            self._disable_tool_dynamic_view()
+            return
+
+        view_node = self._get_primary_3d_view_node()
+        if view_node is None:
+            self._disable_tool_dynamic_view()
+            return
+
+        try:
+            if self._viewpoint_logic is None:
+                self._viewpoint_logic = viewpoint_module.ViewpointLogic()
+            viewpoint_instance = self._viewpoint_logic.getViewpointForViewNode(view_node)
+        except Exception:
+            self._disable_tool_dynamic_view()
+            return
+
+        if viewpoint_instance is None:
+            self._disable_tool_dynamic_view()
+            return
+
+        self._viewpoint_instance = viewpoint_instance
+        self._viewpoint_view_node = view_node
+
+        try:
+            viewpoint_instance.setViewNode(view_node)
+            viewpoint_instance.bullseyeSetTransformNode(self._needle_transform_node)
+            viewpoint_instance.bullseyeChangeTo6DOFMode()
+            viewpoint_instance.bullseyeSetCameraParallelProjection(False)
+            viewpoint_instance.bullseyeSetCameraXPosMm(0.0)
+            viewpoint_instance.bullseyeSetCameraYPosMm(25.0)
+            viewpoint_instance.bullseyeSetCameraZPosMm(160.0)
+            if viewpoint_instance.isCurrentModeBullseye():
+                viewpoint_instance.bullseyeUpdate()
+            elif viewpoint_instance.isCurrentModeOFF():
+                viewpoint_instance.bullseyeStart()
+        except Exception:
+            self._disable_tool_dynamic_view()
+
+    def _volume_reslice_driver_is_driving_slices(self) -> bool:
+        transform_node = self._needle_transform_observed_node
+        if transform_node is None:
+            return False
+        transform_id = transform_node.GetID()
+        if not transform_id:
+            return False
+        try:
+            layout_manager = slicer.app.layoutManager()
+        except Exception:
+            return False
+        if layout_manager is None:
+            return False
+        try:
+            for view_name in ("Red", "Yellow", "Green"):
+                slice_widget = layout_manager.sliceWidget(view_name)
+                if slice_widget is None:
+                    continue
+                slice_node = slice_widget.mrmlSliceNode()
+                if slice_node is None:
+                    continue
+                if slice_node.GetAttribute("VolumeResliceDriver.Driver") == transform_id:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _get_or_create_crosshair_node(self):
+        if self._crosshair_node is not None and self._crosshair_node.GetScene() is None:
+            self._crosshair_node = None
+        if self._crosshair_node is not None:
+            return self._crosshair_node
+        node = slicer.util.getFirstNodeByClassByName("vtkMRMLCrosshairNode", "Crosshair")
+        if node is None:
+            nodes = slicer.util.getNodesByClass("vtkMRMLCrosshairNode")
+            node = nodes[0] if nodes else None
+        if node is None:
+            try:
+                node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLCrosshairNode", "Crosshair")
+            except Exception:
+                node = None
+        self._crosshair_node = node
+        return node
+
+    def _matrix_to_list(self, transform_node) -> list[float]:
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToParent(matrix)
+        return [matrix.GetElement(r, c) for r in range(4) for c in range(4)]
+
+
+class Home(ScriptedLoadableModule):
+    """The home module allows to orchestrate and style the overall application workflow.
+
+    It is a "special" module in the sense that its role is to customize the application and
+    coordinate a workflow between other "regular" modules.
+
+    Associated widget and logic are not intended to be initialized multiple times.
+    """
+
+    def __init__(self, parent: Optional[qt.QWidget]):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = "Home"
+        self.parent.categories = [""]
+        self.parent.dependencies = []
+        self.parent.contributors = ["Healthcare Technology Innovation Centre", "TrackVision Team"]
+        self.parent.helpText = """Guided workspace for CT import, PLUS connectivity, registration, and live needle guidance."""
+        self.parent.helpText += self.getDefaultModuleDocumentationLink()
+        self.parent.acknowledgementText = """Developed for Healthcare Technology Innovation Centre (HTIC)."""
+        qt.QTimer.singleShot(0, _ensure_automatic_pointer_to_ct_chain_started)
+
+
+class HomeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    """Uses ScriptedLoadableModuleWidget base class, available at:
+    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    """
+
+    @property
+    def toolbarNames(self) -> list[str]:
+        return [str(k) for k in self._toolbars]
+
+    _toolbars: dict[str, qt.QToolBar] = {}
+
+    def __init__(self, parent: Optional[qt.QWidget]):
+        """Called when the application opens the module the first time and the widget is initialized."""
+        ScriptedLoadableModuleWidget.__init__(self, parent)
+        VTKObservationMixin.__init__(self)
+
+        self._status_labels: dict[str, qt.QLabel] = {}
+        self._status_dots: dict[str, qt.QLabel] = {}
+        self._status_titles: dict[str, str] = {}
+        self._status_state_values: dict[str, str] = {}
+        self._status_text_values: dict[str, str] = {}
+        self._error_label: Optional[qt.QLabel] = None
+        self._home_settings_button: Optional[qt.QPushButton] = None
+        self._scroll_area: Optional[qt.QScrollArea] = None
+        self._mode_stack: Optional[qt.QStackedWidget] = None
+        self._mode_buttons: dict[str, qt.QPushButton] = {}
+        self._tracking_view_mode: str = "tool_centric"
+        self._tool_centric_button: Optional[qt.QPushButton] = None
+        self._scan_centric_button: Optional[qt.QPushButton] = None
+        self._tool_dynamic_button: Optional[qt.QPushButton] = None
+        self._session_value_labels: dict[str, qt.QLabel] = {}
+        self._session_rows: dict[str, qt.QFrame] = {}
+        self._suspend_settings_updates: bool = False
+        self._runtime_refresh_timer: Optional[qt.QTimer] = None
+        self._runtime_refresh_pending: bool = False
+        self._runtime_motion_seen: bool = False
+        # Wall-clock time of the last observed pose change; "Tracking active"
+        # requires motion within _RUNTIME_MOTION_FRESH_SECONDS so a frozen
+        # stream (occluded camera, stalled acquisition) cannot stay green.
+        self._last_runtime_motion_at: float = 0.0
+        self._last_runtime_needle_transform_id: str = ""
+        self._last_runtime_needle_matrix: Optional[list[float]] = None
+
+        self._dicom_folder_path: Optional[ctk.ctkPathLineEdit] = None
+        self._load_ct_button: Optional[qt.QPushButton] = None
+        self._needle_stl_path: Optional[ctk.ctkPathLineEdit] = None
+        self._load_needle_button: Optional[qt.QPushButton] = None
+        self._registration_matrix_path: Optional[ctk.ctkPathLineEdit] = None
+        self._phantom_geometry_path: Optional[ctk.ctkPathLineEdit] = None
+        self._tool_geometry_path: Optional[ctk.ctkPathLineEdit] = None
+        self._plus_exe_path: Optional[ctk.ctkPathLineEdit] = None
+        self._plus_config_path: Optional[ctk.ctkPathLineEdit] = None
+        self._launcher_host: Optional[qt.QLineEdit] = None
+        self._launcher_port: Optional[qt.QSpinBox] = None
+        self._igtl_host: Optional[qt.QLineEdit] = None
+        self._igtl_port: Optional[qt.QSpinBox] = None
+        self._ct_transform_name: Optional[qt.QLineEdit] = None
+        self._needle_transform_name: Optional[qt.QLineEdit] = None
+        self._invert_registration_matrix: Optional[qt.QCheckBox] = None
+        self._smoothing_slider: Optional[qt.QSlider] = None
+        self._smoothing_value_label: Optional[qt.QLabel] = None
+
+        self._start_button: Optional[qt.QPushButton] = None
+        self._stop_button: Optional[qt.QPushButton] = None
+        self._load_registration_button: Optional[qt.QPushButton] = None
+        self._paste_registration_button: Optional[qt.QPushButton] = None
+        self._initialize_tracking_button: Optional[qt.QPushButton] = None
+        self._start_tracking_button: Optional[qt.QPushButton] = None
+        self._open_reslicer_button: Optional[qt.QPushButton] = None
+        self._open_openigtlink_button: Optional[qt.QPushButton] = None
+        self._open_transforms_button: Optional[qt.QPushButton] = None
+        self._window_slider: Optional[qt.QSlider] = None
+        self._level_slider: Optional[qt.QSlider] = None
+        self._shift_slider: Optional[qt.QSlider] = None
+        self._window_value_label: Optional[qt.QLabel] = None
+        self._level_value_label: Optional[qt.QLabel] = None
+        self._shift_value_label: Optional[qt.QLabel] = None
+        self._window_level_syncing: bool = False
+        self._window_level_defaults_volume_id: str = ""
+        self._shift_slider_syncing: bool = False
+        self._vr_shift_property_node_id: str = ""
+        self._vr_shift_baseline_opacity_points: list[tuple[float, float, float, float]] = []
+        self._vr_shift_baseline_color_points: list[tuple[float, float, float, float, float, float]] = []
+        self._additional_settings_button: Optional[qt.QPushButton] = None
+        self._additional_settings_dialog: Optional[qt.QDialog] = None
+        self._tracking_accuracy_card: Optional[qt.QFrame] = None
+        self._registration_rmse_label: Optional[qt.QLabel] = None
+        self._tool_jitter_rmse_label: Optional[qt.QLabel] = None
+        self._tracking_accuracy_samples: list[tuple[float, tuple[float, float, float]]] = []
+        self._tracking_accuracy_window_seconds: float = 4.0
+        # Live update-rate (FPS) / latency readout state.
+        self._tracking_rate_label: Optional[qt.QLabel] = None
+        self._rate_monitor_node = None
+        self._rate_monitor_observer_tag: Optional[int] = None
+        self._rate_samples: list[tuple[float, Optional[float]]] = []
+        self._rate_window_seconds: float = 3.0
+        self._auto_start_button: Optional[qt.QPushButton] = None
+        self._auto_stop_button: Optional[qt.QPushButton] = None
+
+        # Accuracy Assessment panel state
+        self._accuracy_target_fiducial_node = None  # vtkMRMLMarkupsFiducialNode
+        self._accuracy_measurements: list[dict] = []
+        self._accuracy_check_active: bool = False
+        self._accuracy_current_target_index: int = 0
+        self._accuracy_target_list_widget: Optional[qt.QListWidget] = None
+        self._accuracy_results_table: Optional[qt.QTableWidget] = None
+        self._accuracy_record_button: Optional[qt.QPushButton] = None
+        self._accuracy_save_button: Optional[qt.QPushButton] = None
+        self._accuracy_status_label: Optional[qt.QLabel] = None
+        self._accuracy_start_button: Optional[qt.QPushButton] = None
+        self._accuracy_place_target_button: Optional[qt.QPushButton] = None
+        self._accuracy_remove_target_button: Optional[qt.QPushButton] = None
+        self._accuracy_clear_target_button: Optional[qt.QPushButton] = None
+        self._accuracy_fiducial_observer_tag: Optional[int] = None
+        # The node the tag above was actually registered on — observers must
+        # be removed from the node they were added to, not the current one.
+        self._accuracy_fiducial_observed_node = None
+
+        self._tracking_connected: bool = False
+
+        # Internal PlusServer state
+        self.phantomPath: str = ""
+        self.toolPath: str = ""
+        self.temp_dir: Optional[str] = None
+        self.plus_process: Optional[subprocess.Popen] = None
+        self._port_check_timer: Optional[qt.QTimer] = None
+        self._port_check_start_time: float = 0.0
+        self._plus_atexit_registered: bool = False
+        self._about_to_quit_connected: bool = False
+
+        self._busy_indicator: Optional[qt.QProgressBar] = None
+        self._busy_count: int = 0
+        self._busy_workflow_active: bool = False
+        self._last_pasted_registration_text: str = ""
+        self._operation_progress_dialog: Optional[qt.QDialog] = None
+        self._operation_progress_label: Optional[qt.QLabel] = None
+        self._operation_progress_bar: Optional[qt.QProgressBar] = None
+        self._active_progress_operation: str = ""
+        self._active_progress_failed: bool = False
+
+        self._registration_mode_selected: bool = False
+        self._registration_mode: str = ""
+        self._startup_overlay: Optional[qt.QWidget] = None
+
+        # Shell window that hosts both landing + 2D-2D as pages of one window.
+        self._shell_dialog: Optional[qt.QDialog] = None
+        self._shell_stack: Optional[qt.QStackedWidget] = None
+        self._shell_landing_page_index: int = 0
+        self._shell_2d_2d_page_index: int = 1
+
+        # 2D-2D registration page state (widgets live inside the shell dialog)
+        self._2d_ap_xray_path: str = ""
+        self._2d_lp_xray_path: str = ""
+        self._2d_ap_matrix_path: str = ""
+        self._2d_lp_matrix_path: str = ""
+        self._2d_needle_stl_path: str = ""
+        self._2d_ap_view_label: Optional[qt.QLabel] = None
+        self._2d_lp_view_label: Optional[qt.QLabel] = None
+        self._2d_ap_pixmap: Optional[qt.QPixmap] = None
+        self._2d_lp_pixmap: Optional[qt.QPixmap] = None
+        self._2d_status_label: Optional[qt.QLabel] = None
+        self._2d_init_tracking_button: Optional[qt.QPushButton] = None
+        self._2d_start_tracking_button: Optional[qt.QPushButton] = None
+        self._2d_plus_status_label: Optional[qt.QLabel] = None
+
+        # 2D-2D live tracking / projection overlay state.
+        # Projection matrices are 3x4 numpy arrays (phantom frame -> pixel UV).
+        # The timer polls the MRML PointerToPhantom transform and redraws the
+        # overlays; it is strictly read-only with respect to the tracker nodes
+        # and therefore does not affect the existing 3D-3D tracking chain.
+        self._2d_P_ap: Optional[np.ndarray] = None
+        self._2d_P_lp: Optional[np.ndarray] = None
+        self._2d_tracking_timer: Optional[qt.QTimer] = None
+        # Change token for the 2D-2D tracking tick: last drawn pose matrix +
+        # view label sizes. Lets the ~30 FPS timer skip repainting frames that
+        # would be pixel-identical (the tracker only delivers a few poses/s).
+        self._2d_last_tick_token = None
+
+        # Per-view image-manipulation state (zoom / rotate / W-L / B-C / invert).
+        # The base uint8 numpy array is cached so that brightness, contrast,
+        # window/level and invert can be re-applied non-destructively without
+        # re-reading the file. The processed pixmap is cached and invalidated
+        # whenever pixel-level state changes.
+        self._2d_ap_base_array: Optional[np.ndarray] = None
+        self._2d_lp_base_array: Optional[np.ndarray] = None
+        self._2d_ap_processed_pixmap: Optional[qt.QPixmap] = None
+        self._2d_lp_processed_pixmap: Optional[qt.QPixmap] = None
+        # Cache of the fully rotated + scaled background pixmap (the expensive
+        # SmoothTransformation step). Only the cheap needle overlay is redrawn
+        # per frame; the background is rebuilt solely when its inputs change.
+        self._2d_ap_scaled_cache: Optional[qt.QPixmap] = None
+        self._2d_lp_scaled_cache: Optional[qt.QPixmap] = None
+        self._2d_ap_rotated_cache: Optional[qt.QPixmap] = None
+        self._2d_lp_rotated_cache: Optional[qt.QPixmap] = None
+        self._2d_ap_scaled_key = None
+        self._2d_lp_scaled_key = None
+        # Bumped whenever the BCWL-processed base pixmap is rebuilt/invalidated,
+        # so the scaled-background cache key changes and rebuilds exactly once.
+        self._2d_ap_base_gen = 0
+        self._2d_lp_base_gen = 0
+        self._2d_ap_view_state: dict = self._default_2d_view_state()
+        self._2d_lp_view_state: dict = self._default_2d_view_state()
+
+    def setup(self):
+        """Called when the application opens the module the first time and the widget is initialized."""
+        ScriptedLoadableModuleWidget.setup(self)
+        _ensure_automatic_pointer_to_ct_chain_started()
+
+        # Load widget from .ui file (created by Qt Designer)
+        self.uiWidget = slicer.util.loadUI(self.resourcePath("UI/Home.ui"))
+        self.layout.addWidget(self.uiWidget)
+        self.ui = slicer.util.childWidgetVariables(self.uiWidget)
+
+        # Get references to relevant underlying modules
+        # NA
+
+        # Create logic class
+        self.logic = HomeLogic()
+
+        # Keep the custom widgets on the same palette as the application shell.
+        self.uiWidget.setPalette(slicer.util.mainWindow().style().standardPalette())
+
+        # Remove unneeded UI elements
+        self.modifyWindowUI()
+        self.setCustomUIVisible(True)
+
+        # Apply style
+        self.applyApplicationStyle()
+
+        # Replace the default Slicer application icon with the SpineTracker
+        # branding wherever a window icon is shown (title bar, taskbar, etc.).
+        self._apply_app_icon()
+
+        # Build modern workflow UI
+        self._build_workflow_ui()
+
+        # Ensure PlusServer is killed when the Slicer application closes —
+        # module cleanup() alone is not always called on forced shutdowns.
+        if not self._about_to_quit_connected:
+            try:
+                slicer.app.aboutToQuit.connect(self._shutdown_plus_on_quit)
+                self._about_to_quit_connected = True
+            except Exception:
+                pass
+        self._load_settings_into_ui()
+        self._set_running_ui(False)
+        self._maybe_autofill_transforms_from_plus_config()
+        self._setup_runtime_monitoring()
+        self._refresh_runtime_from_scene()
+
+    def cleanup(self):
+        """Called when the application closes and the module widget is destroyed."""
+        # 1. Stop and delete runtime monitoring timer + observers
+        self._stop_runtime_monitoring()
+        self.removeObservers()
+        # The accuracy fiducial node lives in the scene independent of this
+        # widget — detach our observer or its callback fires into deleted
+        # Qt widgets after a module reload.
+        try:
+            self._accuracy_detach_fiducial_observer()
+        except Exception:
+            pass
+
+        # 2. Stop and delete port-check QTimer
+        if self._port_check_timer is not None:
+            self._port_check_timer.stop()
+            self._port_check_timer.deleteLater()
+            self._port_check_timer = None
+
+        # 3. Terminate PlusServer subprocess
+        self._terminate_plus_process()
+
+        # 4. Delete temp folder
+        if self.temp_dir is not None:
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception:
+                pass
+            self.temp_dir = None
+
+        # 5. Stop workflow (timers, observers, PLUS connections)
+        try:
+            if hasattr(self, "logic") and hasattr(self.logic, "_workflow"):
+                self.logic._workflow.destroy()
+            elif hasattr(self, "logic"):
+                self.logic.stop()
+        except Exception:
+            pass
+
+        # 6. Stop the global auto-chain timer
+        global _automatic_pointer_to_ct_chain
+        if _automatic_pointer_to_ct_chain is not None:
+            try:
+                _automatic_pointer_to_ct_chain.stop()
+            except Exception:
+                pass
+
+        # 7. Disconnect and remove OpenIGTLink connector node from scene
+        try:
+            while True:
+                orphan = slicer.util.getFirstNodeByClassByName(
+                    "vtkMRMLIGTLConnectorNode", "SpineTracker2_OpenIGTLink"
+                )
+                if orphan is None:
+                    break
+                orphan.Stop()
+                slicer.mrmlScene.RemoveNode(orphan)
+        except Exception:
+            pass
+
+    def enter(self):
+        # Hide the main window immediately at startup so the workflow UI
+        # never flashes before the landing page appears.
+        if not self._registration_mode_selected:
+            try:
+                main = slicer.util.mainWindow()
+                if main is not None:
+                    main.hide()
+            except Exception:
+                pass
+        self._move_module_panel_to_right()
+        self.styleThreeDWidget()
+        self.styleSliceWidgets()
+        _ensure_intersecting_slices_visible()
+        self._setup_runtime_monitoring()
+        self._refresh_runtime_from_scene()
+        if not self._registration_mode_selected:
+            qt.QTimer.singleShot(0, self._show_registration_mode_dialog)
+
+    def exit(self):
+        self._stop_runtime_monitoring()
+
+    def _on_back_to_mode_clicked(self):
+        """Return from the workflow to the full-screen registration mode page."""
+        self._registration_mode_selected = False
+        self._registration_mode = ""
+        # Landing will hide the main window itself once shown. Schedule
+        # it via a 0ms timer so this click handler can return first.
+        qt.QTimer.singleShot(0, self._show_registration_mode_dialog)
+
+    def _install_startup_overlay(self):
+        """Paint an opaque black overlay over the main window while the landing
+        dialog is being constructed, so the workflow UI never flashes behind it.
+        """
+        try:
+            main = slicer.util.mainWindow()
+        except Exception:
+            main = None
+        if main is None:
+            return
+        if self._startup_overlay is not None:
+            try:
+                self._startup_overlay.setGeometry(main.rect)
+                self._startup_overlay.raise_()
+                self._startup_overlay.show()
+            except Exception:
+                pass
+            return
+        overlay = qt.QWidget(main)
+        overlay.setObjectName("SpineTrackerStartupOverlay")
+        overlay.setStyleSheet(
+            "QWidget#SpineTrackerStartupOverlay { background: #000000; }"
+        )
+        overlay.setAttribute(qt.Qt.WA_StyledBackground, True)
+        overlay.setGeometry(main.rect)
+        overlay.raise_()
+        overlay.show()
+        self._startup_overlay = overlay
+        try:
+            qt.QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _remove_startup_overlay(self):
+        if self._startup_overlay is None:
+            return
+        try:
+            self._startup_overlay.hide()
+            self._startup_overlay.deleteLater()
+        except Exception:
+            pass
+        self._startup_overlay = None
+
+    def _show_2d_2d_registration_page(self):
+        """Switch the shell window's stack to the 2D-2D page (no new window)."""
+        if self._shell_stack is None:
+            return
+        # Switch to the page FIRST and flush the event loop so that the view
+        # labels get measured at their final expanded size. Rehydrating the
+        # pixmaps before the page has ever been visible causes label.size()
+        # to report the minimum (320x360), which scales the X-ray down and
+        # leaves a small image centred in a large black pane.
+        self._refresh_2d_2d_sidebar_labels()
+        self._shell_stack.setCurrentIndex(self._shell_2d_2d_page_index)
+        try:
+            qt.QApplication.processEvents()
+        except Exception:
+            pass
+        if self._2d_ap_xray_path:
+            self._display_2d_xray(self._2d_ap_view_label, self._2d_ap_xray_path, is_ap=True)
+        if self._2d_lp_xray_path:
+            self._display_2d_xray(self._2d_lp_view_label, self._2d_lp_xray_path, is_ap=False)
+
+    def _build_2d_2d_page_widget(self) -> qt.QWidget:
+        """Build the 2D-2D registration page as a widget that lives inside
+        the shell window's stacked widget (one window, multiple pages)."""
+        page = qt.QWidget()
+        root = qt.QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # --- Top bar: back + title ---
+        top_bar = qt.QFrame()
+        top_bar.setObjectName("TwoDTopBar")
+        top_bar.setFixedHeight(56)
+        top_layout = qt.QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(16, 8, 16, 8)
+        top_layout.setSpacing(12)
+
+        title_label = qt.QLabel("2D / 2D REGISTRATION")
+        title_label.setObjectName("TwoDTitle")
+        top_layout.addWidget(title_label)
+
+        top_layout.addStretch(1)
+
+        close_button = qt.QPushButton("✕  Close")
+        close_button.setObjectName("ShellCloseButton")
+        close_button.setCursor(qt.Qt.PointingHandCursor)
+        close_button.setToolTip("Close the 2D-2D screen and return to the landing page.")
+        close_button.clicked.connect(lambda _checked=False: self._on_2d_2d_back_clicked())
+        top_layout.addWidget(close_button)
+        root.addWidget(top_bar)
+
+        # --- Body: main views + sidebar ---
+        body = qt.QHBoxLayout()
+        body.setContentsMargins(18, 18, 18, 18)
+        body.setSpacing(18)
+
+        # Views column
+        views_column = qt.QHBoxLayout()
+        views_column.setSpacing(18)
+
+        ap_frame, self._2d_ap_view_label = self._create_2d_view_pane(
+            "AP X-RAY VIEW", "No AP X-ray loaded", is_ap=True,
+        )
+        lp_frame, self._2d_lp_view_label = self._create_2d_view_pane(
+            "LP X-RAY VIEW", "No LP X-ray loaded", is_ap=False,
+        )
+        views_column.addWidget(ap_frame, 1)
+        views_column.addWidget(lp_frame, 1)
+
+        views_wrapper = qt.QWidget()
+        views_wrapper.setLayout(views_column)
+        body.addWidget(views_wrapper, 1)
+
+        # Sidebar column
+        sidebar = self._create_2d_sidebar()
+        body.addWidget(sidebar, 0)
+
+        body_wrapper = qt.QWidget()
+        body_wrapper.setLayout(body)
+        root.addWidget(body_wrapper, 1)
+
+        return page
+
+    def _create_2d_view_pane(self, title_text: str, placeholder: str, is_ap: bool):
+        frame = qt.QFrame()
+        frame.setObjectName("TwoDViewFrame")
+        layout = qt.QVBoxLayout(frame)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header = qt.QLabel(title_text)
+        header.setObjectName("TwoDViewTitle")
+        header.setAlignment(qt.Qt.AlignCenter)
+        layout.addWidget(header)
+
+        # Per-view toolbar (zoom / rotate / invert / B / C / W-L / reset).
+        toolbar = self._create_2d_view_toolbar(is_ap)
+        layout.addWidget(toolbar)
+
+        image_label = qt.QLabel(placeholder)
+        image_label.setObjectName("TwoDViewImage")
+        image_label.setAlignment(qt.Qt.AlignCenter)
+        image_label.setMinimumSize(320, 360)
+        image_label.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Expanding)
+        image_label.setScaledContents(False)
+        layout.addWidget(image_label, 1)
+
+        return frame, image_label
+
+    def _create_2d_sidebar(self):
+        sidebar = qt.QFrame()
+        sidebar.setObjectName("TwoDSidebar")
+        sidebar.setFixedWidth(380)
+        layout = qt.QVBoxLayout(sidebar)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        section_inputs = qt.QLabel("INPUTS")
+        section_inputs.setObjectName("TwoDSectionLabel")
+        layout.addWidget(section_inputs)
+
+        self._2d_ap_xray_button = self._create_2d_action_button("Load AP X-ray")
+        self._2d_ap_xray_button.clicked.connect(self._on_2d_load_ap_xray)
+        layout.addWidget(self._2d_ap_xray_button)
+        self._2d_ap_xray_path_label = self._create_2d_path_label(self._2d_ap_xray_path)
+        layout.addWidget(self._2d_ap_xray_path_label)
+
+        self._2d_lp_xray_button = self._create_2d_action_button("Load LP X-ray")
+        self._2d_lp_xray_button.clicked.connect(self._on_2d_load_lp_xray)
+        layout.addWidget(self._2d_lp_xray_button)
+        self._2d_lp_xray_path_label = self._create_2d_path_label(self._2d_lp_xray_path)
+        layout.addWidget(self._2d_lp_xray_path_label)
+
+        self._2d_ap_matrix_button = self._create_2d_action_button("Load AP Projection Matrix")
+        self._2d_ap_matrix_button.clicked.connect(self._on_2d_load_ap_matrix)
+        layout.addWidget(self._2d_ap_matrix_button)
+        self._2d_ap_matrix_path_label = self._create_2d_path_label(self._2d_ap_matrix_path)
+        layout.addWidget(self._2d_ap_matrix_path_label)
+
+        self._2d_lp_matrix_button = self._create_2d_action_button("Load LP Projection Matrix")
+        self._2d_lp_matrix_button.clicked.connect(self._on_2d_load_lp_matrix)
+        layout.addWidget(self._2d_lp_matrix_button)
+        self._2d_lp_matrix_path_label = self._create_2d_path_label(self._2d_lp_matrix_path)
+        layout.addWidget(self._2d_lp_matrix_path_label)
+
+        layout.addSpacing(16)
+
+        section_track = qt.QLabel("TRACKING")
+        section_track.setObjectName("TwoDSectionLabel")
+        layout.addWidget(section_track)
+
+        self._2d_init_tracking_button = qt.QPushButton("Init Tracking")
+        self._2d_init_tracking_button.setObjectName("TwoDActionButton")
+        self._2d_init_tracking_button.setCursor(qt.Qt.PointingHandCursor)
+        self._2d_init_tracking_button.setToolTip(
+            "Launch PlusServer using the phantom/tool geometry set in Additional Settings."
+        )
+        self._2d_init_tracking_button.clicked.connect(self._on_2d_init_tracking_clicked)
+        layout.addWidget(self._2d_init_tracking_button)
+
+        self._2d_start_tracking_button = qt.QPushButton("Start Tracking")
+        self._2d_start_tracking_button.setObjectName("TwoDActionButton")
+        self._2d_start_tracking_button.setCursor(qt.Qt.PointingHandCursor)
+        self._2d_start_tracking_button.setToolTip(
+            "Start the live overlay refresh. PlusServer must already be running "
+            "(launched here via Init Tracking, or from the 2D-3D / 3D-3D workflow)."
+        )
+        self._2d_start_tracking_button.clicked.connect(self._on_2d_start_tracking_clicked)
+        layout.addWidget(self._2d_start_tracking_button)
+
+        self._2d_plus_status_label = qt.QLabel("PlusServer: Not started")
+        self._2d_plus_status_label.setObjectName("TwoDPlusStatus")
+        self._2d_plus_status_label.setWordWrap(True)
+        self._2d_plus_status_label.setAlignment(qt.Qt.AlignCenter)
+        self._apply_2d_plus_status_style(success=False, error=False)
+        layout.addWidget(self._2d_plus_status_label)
+        # Reflect any state already established by an earlier launch (e.g.
+        # PlusServer started from the 2D-3D / 3D-3D workflow before the user
+        # opened the 2D-2D page).
+        self._sync_2d_plus_status_from_main()
+
+        self._2d_status_label = qt.QLabel("")
+        self._2d_status_label.setObjectName("TwoDStatus")
+        self._2d_status_label.setWordWrap(True)
+        layout.addWidget(self._2d_status_label)
+
+        layout.addStretch(1)
+        return sidebar
+
+    def _create_2d_action_button(self, label: str) -> qt.QPushButton:
+        btn = qt.QPushButton(label)
+        btn.setObjectName("TwoDActionButton")
+        btn.setCursor(qt.Qt.PointingHandCursor)
+        return btn
+
+    def _create_2d_path_label(self, path: str) -> qt.QLabel:
+        label = qt.QLabel(self._2d_format_path(path))
+        label.setObjectName("TwoDPathLabel")
+        label.setWordWrap(True)
+        return label
+
+    def _2d_format_path(self, path: str) -> str:
+        if not path:
+            return "— no file loaded"
+        return os.path.basename(path)
+
+    def _refresh_2d_2d_sidebar_labels(self):
+        mappings = (
+            ("_2d_ap_xray_path_label", self._2d_ap_xray_path),
+            ("_2d_lp_xray_path_label", self._2d_lp_xray_path),
+            ("_2d_ap_matrix_path_label", self._2d_ap_matrix_path),
+            ("_2d_lp_matrix_path_label", self._2d_lp_matrix_path),
+        )
+        for attr, path in mappings:
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(self._2d_format_path(path))
+
+    def _on_2d_load_ap_xray(self):
+        path = qt.QFileDialog.getOpenFileName(
+            self._shell_dialog or slicer.util.mainWindow(),
+            "Select AP X-ray Image",
+            "",
+            "X-ray images (*.dcm *.dicom *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+            "DICOM (*.dcm *.dicom);;"
+            "Standard images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+            "All files (*)",
+        )
+        if not path:
+            return
+        self._2d_ap_xray_path = path
+        self._refresh_2d_2d_sidebar_labels()
+        self._display_2d_xray(self._2d_ap_view_label, path, is_ap=True)
+        self._set_2d_status(f"AP X-ray loaded: {os.path.basename(path)}")
+
+    def _on_2d_load_lp_xray(self):
+        path = qt.QFileDialog.getOpenFileName(
+            self._shell_dialog or slicer.util.mainWindow(),
+            "Select LP X-ray Image",
+            "",
+            "X-ray images (*.dcm *.dicom *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+            "DICOM (*.dcm *.dicom);;"
+            "Standard images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+            "All files (*)",
+        )
+        if not path:
+            return
+        self._2d_lp_xray_path = path
+        self._refresh_2d_2d_sidebar_labels()
+        self._display_2d_xray(self._2d_lp_view_label, path, is_ap=False)
+        self._set_2d_status(f"LP X-ray loaded: {os.path.basename(path)}")
+
+    def _on_2d_load_ap_matrix(self):
+        path = qt.QFileDialog.getOpenFileName(
+            self._shell_dialog or slicer.util.mainWindow(),
+            "Select AP Projection Matrix",
+            "",
+            "Text files (*.txt *.csv *.tsv);;All files (*)",
+        )
+        if not path:
+            return
+        matrix = self._parse_projection_matrix(path)
+        if matrix is None:
+            self._set_2d_status(
+                f"AP projection matrix invalid: expected 12 numbers in {os.path.basename(path)}"
+            )
+            return
+        self._2d_ap_matrix_path = path
+        matrix = self._maybe_scale_normalized_projection_matrix("AP", matrix)
+        self._2d_P_ap = matrix
+        self._log_2d_projection_axis_mapping("AP", matrix)
+        self._refresh_2d_2d_sidebar_labels()
+        self._refresh_2d_overlay(is_ap=True)
+        self._set_2d_status(f"AP projection matrix loaded: {os.path.basename(path)}")
+
+    def _on_2d_load_lp_matrix(self):
+        path = qt.QFileDialog.getOpenFileName(
+            self._shell_dialog or slicer.util.mainWindow(),
+            "Select LP Projection Matrix",
+            "",
+            "Text files (*.txt *.csv *.tsv);;All files (*)",
+        )
+        if not path:
+            return
+        matrix = self._parse_projection_matrix(path)
+        if matrix is None:
+            self._set_2d_status(
+                f"LP projection matrix invalid: expected 12 numbers in {os.path.basename(path)}"
+            )
+            return
+        self._2d_lp_matrix_path = path
+        matrix = self._maybe_scale_normalized_projection_matrix("LP", matrix)
+        self._2d_P_lp = matrix
+        self._log_2d_projection_axis_mapping("LP", matrix)
+        self._refresh_2d_2d_sidebar_labels()
+        self._refresh_2d_overlay(is_ap=False)
+        self._set_2d_status(f"LP projection matrix loaded: {os.path.basename(path)}")
+
+    def _display_2d_xray(self, label: Optional[qt.QLabel], path: str, is_ap: bool):
+        if label is None or not path:
+            return
+        # Load into a uint8 grayscale numpy array so that brightness,
+        # contrast, window/level and invert can be re-applied non-
+        # destructively. Falls back to QPixmap-only loading if the array
+        # path fails (in which case those controls become no-ops for that
+        # image, but zoom + rotate + reset still work).
+        arr = self._load_2d_xray_array(path)
+        if arr is not None:
+            pixmap = self._numpy_to_pixmap(arr)
+        else:
+            pixmap = qt.QPixmap(path)
+            if pixmap.isNull():
+                pixmap = None
+        if pixmap is None or pixmap.isNull():
+            label.setText(f"Failed to load image: {os.path.basename(path)}")
+            return
+        if is_ap:
+            self._2d_ap_base_array = arr
+            self._2d_ap_pixmap = pixmap
+            self._2d_ap_processed_pixmap = None
+            self._2d_ap_base_gen += 1
+        else:
+            self._2d_lp_base_array = arr
+            self._2d_lp_pixmap = pixmap
+            self._2d_lp_processed_pixmap = None
+            self._2d_lp_base_gen += 1
+        # Refresh immediately, plus defer extra refreshes so the overlay
+        # re-scales itself once the layout has finalised the label size.
+        # On the first entry to the 2D-2D page, label.size() can briefly
+        # report its minimum, which scales the image too small; the later
+        # ticks re-scale to the real size.
+        self._refresh_2d_overlay(is_ap)
+        try:
+            qt.QTimer.singleShot(0, lambda a=is_ap: self._refresh_2d_overlay(a))
+            qt.QTimer.singleShot(80, lambda a=is_ap: self._refresh_2d_overlay(a))
+        except Exception:
+            pass
+
+    def _load_2d_xray_array(self, path: str) -> Optional[np.ndarray]:
+        """Load any supported X-ray image as a uint8 grayscale numpy array.
+        Supports DICOM (.dcm / .dicom) and standard image formats. Returns
+        None on failure."""
+        if not path:
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".dcm", ".dicom"):
+            return self._load_dicom_as_array(path)
+        try:
+            from PIL import Image
+            im = Image.open(path).convert("L")
+            return np.ascontiguousarray(np.asarray(im, dtype=np.uint8))
+        except Exception:
+            logging.exception("PIL load failed for %s; trying QPixmap fallback", path)
+        try:
+            pixmap = qt.QPixmap(path)
+            if pixmap.isNull():
+                return None
+            qimg = pixmap.toImage().convertToFormat(qt.QImage.Format_Grayscale8)
+            w, h = qimg.width(), qimg.height()
+            # QImage scanlines are padded to 4-byte boundaries: read the real
+            # stride and slice off the padding, otherwise any width not a
+            # multiple of 4 produces a diagonally sheared image.
+            bpl = qimg.bytesPerLine()
+            buf = qimg.bits().asstring(bpl * h)
+            arr = np.frombuffer(buf, dtype=np.uint8, count=bpl * h).reshape((h, bpl))[:, :w]
+            return np.ascontiguousarray(arr.copy())
+        except Exception:
+            logging.exception("QPixmap-to-array fallback failed for %s", path)
+            return None
+
+    def _load_dicom_as_array(self, path: str) -> Optional[np.ndarray]:
+        """Read a DICOM file (pydicom, with vtkDICOMImageReader fallback) and
+        return a normalized uint8 grayscale numpy array."""
+        arr = None
+        photometric = "MONOCHROME2"
+        try:
+            import pydicom
+            ds = pydicom.dcmread(path, force=True)
+            arr = ds.pixel_array
+            photometric = str(getattr(ds, "PhotometricInterpretation", "MONOCHROME2"))
+        except Exception:
+            logging.exception("pydicom read failed for %s; trying vtkDICOMImageReader", path)
+            try:
+                from vtk.util import numpy_support
+                reader = vtk.vtkDICOMImageReader()
+                reader.SetFileName(path)
+                reader.Update()
+                image = reader.GetOutput()
+                if image is None:
+                    return None
+                dims = image.GetDimensions()
+                w, h = dims[0], dims[1]
+                scalars = image.GetPointData().GetScalars()
+                if scalars is None:
+                    return None
+                raw = numpy_support.vtk_to_numpy(scalars)
+                arr = np.flipud(raw.reshape(h, w))
+            except Exception:
+                logging.exception("vtkDICOMImageReader also failed for %s", path)
+                return None
+        try:
+            arr = np.asarray(arr)
+            if arr.ndim == 4:
+                # Multi-frame colour (frames, H, W, channels): first frame.
+                arr = arr[0]
+            if arr.ndim == 3:
+                if arr.shape[-1] in (3, 4):
+                    # Colour (H, W, RGB/RGBA): take one channel.
+                    arr = arr[..., 0]
+                else:
+                    # Multi-frame grayscale cine (frames, H, W): first frame.
+                    # arr[..., 0] here would collapse the WRONG axis and
+                    # produce a garbage (frames, H) "image".
+                    arr = arr[0]
+            arr = arr.astype(np.float32)
+            amin = float(arr.min())
+            amax = float(arr.max())
+            if amax > amin:
+                arr = (arr - amin) / (amax - amin) * 255.0
+            arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+            if photometric == "MONOCHROME1":
+                arr = 255 - arr
+            return np.ascontiguousarray(arr)
+        except Exception:
+            logging.exception("DICOM pixel conversion failed for %s", path)
+            return None
+
+    def _numpy_to_pixmap(self, arr: Optional[np.ndarray]) -> Optional[qt.QPixmap]:
+        """Convert a uint8 grayscale numpy array to a QPixmap. Uses PIL PNG
+        round-trip first (most reliable across PythonQt builds), with a
+        direct QImage fallback."""
+        if arr is None:
+            return None
+        try:
+            from PIL import Image
+            import io
+            buf = io.BytesIO()
+            Image.fromarray(arr, mode="L").save(buf, format="PNG")
+            pixmap = qt.QPixmap()
+            pixmap.loadFromData(buf.getvalue())
+            if not pixmap.isNull():
+                return pixmap
+        except Exception:
+            logging.exception("PIL PNG encode failed; trying QImage direct")
+        try:
+            h, w = arr.shape
+            qimg = qt.QImage(arr.tobytes(), w, h, w, qt.QImage.Format_Grayscale8)
+            return qt.QPixmap.fromImage(qimg.copy())
+        except Exception:
+            logging.exception("QImage conversion failed")
+            return None
+
+    def _set_2d_status(self, text: str):
+        if self._2d_status_label is not None:
+            self._2d_status_label.setText(text)
+
+    # --- 2D-2D projection overlay pipeline ---------------------------------
+    # The XML launched by Init Tracking already emits PointerToPhantom (among
+    # others) into the MRML scene. Here we only *read* that node, build the
+    # pixel-space projection by multiplying the loaded 3x4 projection matrix
+    # (phantom frame -> image UV) with the live pointer pose, and paint the
+    # result onto a copy of the X-ray pixmap. Nothing about the tracker node
+    # graph is modified, so 3D-3D tracking keeps working unchanged.
+
+    def _parse_projection_matrix(self, path: str) -> Optional[np.ndarray]:
+        """Read a 3x4 projection matrix from a text file. Accepts any
+        whitespace / comma separation and ignores non-numeric content."""
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fp:
+                text = fp.read()
+        except Exception:
+            logging.exception("Failed to read projection matrix %s", path)
+            return None
+        numbers = _FLOAT_RE.findall(text)
+        if len(numbers) < 12:
+            return None
+        try:
+            values = [float(n) for n in numbers[:12]]
+        except ValueError:
+            return None
+        return np.asarray(values, dtype=np.float64).reshape(3, 4)
+
+    def _get_live_pointer_to_phantom_matrix(self) -> Optional[np.ndarray]:
+        """Return the 4x4 PointerToPhantom matrix currently in the MRML scene
+        as a numpy array. Returns None if the node has not been created yet."""
+        try:
+            node = slicer.mrmlScene.GetFirstNodeByName(_DEFAULT_POINTER_TO_PHANTOM_NAME)
+        except Exception:
+            return None
+        if node is None or not node.IsA("vtkMRMLLinearTransformNode"):
+            return None
+        vtk_mat = vtk.vtkMatrix4x4()
+        try:
+            node.GetMatrixTransformToParent(vtk_mat)
+        except Exception:
+            return None
+        out = np.empty((4, 4), dtype=np.float64)
+        for i in range(4):
+            for j in range(4):
+                out[i, j] = vtk_mat.GetElement(i, j)
+        return out
+
+    def _maybe_scale_normalized_projection_matrix(
+        self, view_label: str, matrix: np.ndarray
+    ) -> np.ndarray:
+        """If the loaded P projects the phantom origin into normalized [0,1]
+        UV instead of pixel UV, premultiply by a diag(W, H, 1) scaling matrix
+        so subsequent projection lands in pixel coordinates of the displayed
+        label. Returns the original matrix when it already produces pixel UVs.
+
+        Detection: project [0,0,0,1] through P; if |u|<=1 AND |v|<=1 the
+        matrix is treated as normalized.
+        """
+        if matrix is None:
+            return matrix
+        try:
+            arr = np.asarray(matrix, dtype=np.float64)
+        except Exception:
+            return matrix
+        if arr.shape != (3, 4):
+            return matrix
+        try:
+            test = arr @ np.array([0.0, 0.0, 0.0, 1.0])
+        except Exception:
+            return matrix
+        if abs(test[2]) < 1e-9:
+            return matrix
+        tu = float(test[0] / test[2])
+        tv = float(test[1] / test[2])
+        if not (abs(tu) <= 1.0 and abs(tv) <= 1.0):
+            return matrix
+        # Scale to the BASE X-RAY IMAGE dimensions, not the on-screen label:
+        # the overlay pipeline consumes projected UVs in base-image pixel
+        # space (rotation mapping + display rescale happen downstream), so a
+        # label-sized scale puts the needle at the wrong position whenever
+        # label size != image size, and bakes in whatever the label size
+        # happened to be at matrix-load time.
+        pix = self._2d_ap_pixmap if view_label == "AP" else self._2d_lp_pixmap
+        lbl_w = lbl_h = 0
+        if pix is not None and not pix.isNull():
+            lbl_w, lbl_h = int(pix.width()), int(pix.height())
+        if lbl_w <= 0 or lbl_h <= 0:
+            # X-ray not loaded yet — fall back to the label size as before.
+            lbl = self._2d_ap_view_label if view_label == "AP" else self._2d_lp_view_label
+            if lbl is not None:
+                try:
+                    lbl_w = max(int(lbl.width), 640)
+                    lbl_h = max(int(lbl.height), 480)
+                except Exception:
+                    lbl_w, lbl_h = 800, 600
+            else:
+                lbl_w, lbl_h = 800, 600
+        scale = np.array(
+            [
+                [float(lbl_w), 0.0, 0.0],
+                [0.0, float(lbl_h), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        scaled = scale @ arr
+        try:
+            _module_logger.info(
+                "[%s] P was normalized (origin UV=(%.4f,%.4f)) -- scaled to %dx%d pixels",
+                view_label, tu, tv, lbl_w, lbl_h,
+            )
+        except Exception:
+            pass
+        return scaled
+
+    def _log_2d_projection_axis_mapping(self, view_label: str, P: np.ndarray):
+        """One-shot startup log: project the phantom origin and the three
+        100-mm axis tips through P so the operator can see the axis mapping
+        and image-plane scale of the loaded projection matrix in the log
+        before any live tracking starts.
+        """
+        if P is None:
+            return
+        try:
+            P_arr = np.asarray(P, dtype=np.float64)
+        except Exception:
+            return
+        probe_points = (
+            ("origin",      np.array([  0.0,   0.0,   0.0, 1.0])),
+            ("X+100mm",     np.array([100.0,   0.0,   0.0, 1.0])),
+            ("Y+100mm",     np.array([  0.0, 100.0,   0.0, 1.0])),
+            ("Z+100mm",     np.array([  0.0,   0.0, 100.0, 1.0])),
+        )
+        try:
+            with np.printoptions(precision=4, suppress=True):
+                _module_logger.info(
+                    "[%s] Loaded projection matrix P (3x4):\n%s",
+                    view_label, str(P_arr),
+                )
+                for name, pt in probe_points:
+                    uvw = P_arr @ pt
+                    if abs(uvw[2]) > 1e-9:
+                        u = float(uvw[0] / uvw[2])
+                        v = float(uvw[1] / uvw[2])
+                        _module_logger.info(
+                            "[%s] %s -> UV=(%.2f, %.2f) w=%.4f",
+                            view_label, name, u, v, float(uvw[2]),
+                        )
+                    else:
+                        _module_logger.warning(
+                            "[%s] %s has near-zero w (%.6g) -- P may be degenerate",
+                            view_label, name, float(uvw[2]),
+                        )
+        except Exception:
+            logging.exception("Failed to log %s axis-mapping diagnostics", view_label)
+
+    def _compute_2d_projected_endpoints(self, P: np.ndarray, view_label: str = ""):
+        """Project the tool into image space using a TRUE 2D direction.
+
+        Pipeline:
+          1. Tip projected through P from the raw PointerToPhantom translation.
+          2. Best-column selection across the corrected pointer rotation:
+             whichever column (X/Y/Z) gives the largest image-space
+             displacement under P is used as the tool-forward axis. This
+             auto-corrects axis-mapping discrepancies between AP and LP and
+             keeps both views responsive to rotation.
+          3. Adaptive probe direction with flip guard so when the probe lands
+             behind the camera (negative w) the opposite direction is used and
+             the resulting image-space direction is flipped back.
+          4. Foreshortening guard: when image-space displacement is below
+             ~5 px the tool is aimed nearly straight at the camera, and we
+             return three identical UVs as a sentinel so the painter draws
+             a dot instead of an arbitrary line.
+          5. Line lengths scaled to the displayed label diagonal so the
+             overlay stays visible across very different X-ray crops.
+
+        Co-linearity of the blue body and yellow guidance line is preserved
+        because both are extended along the same image-space direction.
+        """
+        mat = self._get_live_pointer_to_phantom_matrix()
+        if mat is None:
+            return None
+
+        # Tip in phantom space: raw translation of the uncorrected matrix so
+        # the projected tip lands exactly on the physical tool tip.
+        tip_phantom = mat @ np.array([0.0, 0.0, 0.0, 1.0])
+
+        # Step 3: project the tip first so best-column selection has a
+        # reference for image-space displacement.
+        tip_uvw = P @ tip_phantom
+        if abs(tip_uvw[2]) < 1e-6:
+            return None
+        tip_uv_arr = np.array(
+            [tip_uvw[0] / tip_uvw[2], tip_uvw[1] / tip_uvw[2]], dtype=np.float64
+        )
+
+        # Tool-forward axis in phantom space. The hardware correction
+        # _POINTER_TO_TOOL_CORRECTION is defined (lines 57–66) so that the +Z
+        # column of (PointerToPhantom @ correction) is the physical tool
+        # forward direction. Locking to that single axis — instead of
+        # searching for the largest image-space displacement — keeps the AP
+        # and LP overlays consistent: previously the search picked different
+        # columns/signs per view (whichever projected longest), which is what
+        # caused the AP-vs-LP directional mismatch.
+        tip_uv_for_disp = tip_uvw[:2] / tip_uvw[2]
+        _corr = np.array(_POINTER_TO_TOOL_CORRECTION, dtype=np.float64)[:3, :3]
+        corrected_rot = mat[:3, :3] @ _corr.T
+        # Negate the +Z column: the correction's +Z column was previously
+        # pointing toward the handle, which made the yellow guidance line
+        # extend behind the tool instead of past the tip into the tissue.
+        # Flipping the sign here keeps both AP and LP locked to the same
+        # axis (still column index 2) while making "forward" mean "out of
+        # the tip in the insertion direction".
+        forward_axis = -corrected_rot[:, 2]
+        f_norm = float(np.linalg.norm(forward_axis))
+        if f_norm < 1e-9:
+            return None
+        forward_dir = forward_axis / f_norm
+        best_col = 2
+        best_sign = 1.0
+        best_disp = 0.0
+
+        if not hasattr(self, "_2d_diag_last_log_time"):
+            self._2d_diag_last_log_time = {}
+        now_col = time.time()
+        last_col = self._2d_diag_last_log_time.get(view_label + "_col", 0.0)
+        if view_label and now_col - last_col > 1.0:
+            self._2d_diag_last_log_time[view_label + "_col"] = now_col
+            try:
+                _module_logger.info(
+                    "[%s] best forward col=%d sign=%+d disp=%.1fpx forward=%s",
+                    view_label, best_col, int(best_sign), best_disp,
+                    str(np.round(forward_dir, 3)),
+                )
+            except Exception:
+                pass
+
+        # FIX 1: adaptive probe direction. If the +forward probe lands behind
+        # the camera, fall back to -forward and flip the resulting image
+        # direction so the guidance line still points ahead of the tip.
+        probe_depth_mm = 50.0
+        probe_pt_fwd = tip_phantom[:3] + forward_dir * probe_depth_mm
+        probe_uvw = P @ np.append(probe_pt_fwd, 1.0)
+        img_dir_flip = False
+        if probe_uvw[2] < 1e-6:
+            probe_pt_bwd = tip_phantom[:3] - forward_dir * probe_depth_mm
+            probe_uvw = P @ np.append(probe_pt_bwd, 1.0)
+            img_dir_flip = True
+        if abs(probe_uvw[2]) < 1e-6:
+            return None
+
+        probe_uv_arr = np.array(
+            [probe_uvw[0] / probe_uvw[2], probe_uvw[1] / probe_uvw[2]],
+            dtype=np.float64,
+        )
+
+        img_dir = probe_uv_arr - tip_uv_arr
+        if img_dir_flip:
+            img_dir = -img_dir
+        img_norm = float(np.linalg.norm(img_dir))
+
+        # FIX 3: foreshortening guard — tool aimed nearly straight at the
+        # camera. Return identical UVs as a sentinel so _paint_needle_overlay
+        # draws a dot instead of an arbitrary line.
+        if img_norm < 5.0:
+            if view_label:
+                try:
+                    _module_logger.info(
+                        "[%s] Tool aimed at camera (img_disp=%.1fpx) — showing dot",
+                        view_label, img_norm,
+                    )
+                except Exception:
+                    pass
+            tip_t = (float(tip_uv_arr[0]), float(tip_uv_arr[1]))
+            return tip_t, tip_t, tip_t
+
+        img_dir = img_dir / img_norm
+        # forward_dir is already the tool-forward axis (+Z of the corrected
+        # pointer rotation) pointing from handle through tip into tissue —
+        # so img_dir (probe minus tip) is the guidance direction. No flip.
+
+        # FIX 4 (Issue C): line lengths sized from the BASE X-RAY IMAGE
+        # diagonal. These lengths are added to tip_uv in base-image pixel
+        # space and only later rescaled to the display, so sizing them from
+        # the label diagonal made the on-screen length depend on the ratio
+        # of label size to image resolution (tiny lines for hi-res X-rays,
+        # overshoot for small ones). Image-diagonal units keep the overlay a
+        # constant fraction of the displayed X-ray regardless of resolution.
+        base_pm = self._2d_ap_pixmap if view_label == "AP" else self._2d_lp_pixmap
+        lbl_w, lbl_h = 800, 600
+        if base_pm is not None and not base_pm.isNull():
+            lbl_w = max(int(base_pm.width()), 1)
+            lbl_h = max(int(base_pm.height()), 1)
+        else:
+            # X-ray not loaded — fall back to the label geometry as before.
+            lbl = self._2d_ap_view_label if view_label == "AP" else self._2d_lp_view_label
+            if lbl is not None:
+                try:
+                    w_actual = int(lbl.width)
+                    h_actual = int(lbl.height)
+                    if w_actual > 300 and h_actual > 300:
+                        lbl_w, lbl_h = w_actual, h_actual
+                    else:
+                        try:
+                            hint = lbl.sizeHint()
+                            lbl_w = max(int(hint.width()), 800)
+                            lbl_h = max(int(hint.height()), 600)
+                        except Exception:
+                            lbl_w, lbl_h = 800, 600
+                except Exception:
+                    lbl_w, lbl_h = 800, 600
+        img_diag = math.sqrt(lbl_w * lbl_w + lbl_h * lbl_h)
+        guidance_length_px = img_diag * 0.65
+        body_length_px = img_diag * 0.22
+
+        guidance_uv_arr = tip_uv_arr + img_dir * guidance_length_px
+        tool_back_uv_arr = tip_uv_arr - img_dir * body_length_px
+
+        # FIX 6: per-frame direction diagnostic (throttled at 1 Hz per view).
+        now_dir = time.time()
+        last_dir = self._2d_diag_last_log_time.get(view_label + "_dir", 0.0)
+        if view_label and now_dir - last_dir > 1.0:
+            self._2d_diag_last_log_time[view_label + "_dir"] = now_dir
+            try:
+                _module_logger.info(
+                    "[%s] tip_uv=(%.1f,%.1f) img_dir=(%.3f,%.3f) "
+                    "guidance_px=%.1f body_px=%.1f tip_w=%.4f",
+                    view_label,
+                    float(tip_uv_arr[0]), float(tip_uv_arr[1]),
+                    float(img_dir[0]), float(img_dir[1]),
+                    guidance_length_px, body_length_px,
+                    float(tip_uvw[2]),
+                )
+            except Exception:
+                pass
+
+        # Throttled scene-state diagnostic (separate 1 Hz per view).
+        self._log_2d_projection_diagnostics(
+            view_label, P, mat, tip_phantom, tip_uvw, probe_uvw, probe_uvw, forward_dir,
+        )
+
+        return (
+            (float(tip_uv_arr[0]), float(tip_uv_arr[1])),
+            (float(guidance_uv_arr[0]), float(guidance_uv_arr[1])),
+            (float(tool_back_uv_arr[0]), float(tool_back_uv_arr[1])),
+        )
+
+    def _log_2d_projection_diagnostics(
+        self, view_label, P, mat, tip_phantom, tip_uvw, guidance_uvw, tool_back_uvw, forward_dir,
+    ):
+        """Throttled (1 Hz per view) diagnostic dump of the 2D-2D projection
+        pipeline. Logs the loaded P, the live pointer-to-phantom matrix, the
+        tip in phantom space, and the projected UV homogeneous coordinates so
+        that AP vs LP discrepancies can be isolated."""
+        if not view_label:
+            return
+        if not hasattr(self, "_2d_diag_last_log_time"):
+            self._2d_diag_last_log_time = {}
+        now = time.time()
+        last = self._2d_diag_last_log_time.get(view_label, 0.0)
+        if now - last < 1.0:
+            return
+        self._2d_diag_last_log_time[view_label] = now
+        if not hasattr(self, "_2d_diag_announced_unified"):
+            _module_logger.info("AP correction matrix applied: unified with LP")
+            self._2d_diag_announced_unified = True
+        try:
+            with np.printoptions(precision=4, suppress=True):
+                _module_logger.info("[%s] P (3x4):\n%s", view_label, str(np.asarray(P)))
+                origin_uvw = np.asarray(P) @ np.array([0.0, 0.0, 0.0, 1.0])
+                if abs(origin_uvw[2]) > 1e-9:
+                    _module_logger.info(
+                        "[%s] Phantom origin projects to UV=(%.2f, %.2f) w=%.4f (should be near image center if P is valid)",
+                        view_label,
+                        float(origin_uvw[0] / origin_uvw[2]),
+                        float(origin_uvw[1] / origin_uvw[2]),
+                        float(origin_uvw[2]),
+                    )
+                else:
+                    _module_logger.warning(
+                        "[%s] Phantom origin has near-zero w (%.6g) — P may be degenerate",
+                        view_label, float(origin_uvw[2]),
+                    )
+                _module_logger.info("[%s] PointerToPhantom (4x4):\n%s", view_label, str(np.asarray(mat)))
+                _module_logger.info(
+                    "[%s] forward_dir (phantom): %s",
+                    view_label, str(np.asarray(forward_dir)),
+                )
+                _module_logger.info("[%s] Tip in phantom frame: %s", view_label, str(tip_phantom))
+                _module_logger.info(
+                    "[%s] Tip projected UV (homogeneous): %s -> uv=(%.2f, %.2f) w=%.4f",
+                    view_label, str(tip_uvw),
+                    float(tip_uvw[0] / tip_uvw[2]) if abs(tip_uvw[2]) > 1e-9 else float("nan"),
+                    float(tip_uvw[1] / tip_uvw[2]) if abs(tip_uvw[2]) > 1e-9 else float("nan"),
+                    float(tip_uvw[2]),
+                )
+                _module_logger.info(
+                    "[%s] guidance UV (homogeneous): %s", view_label, str(guidance_uvw),
+                )
+                _module_logger.info(
+                    "[%s] tool_back UV (homogeneous): %s", view_label, str(tool_back_uvw),
+                )
+        except Exception:
+            logging.exception("Failed to log 2D projection diagnostics")
+
+    def _paint_needle_overlay(self, pixmap: qt.QPixmap, tip_uv, guidance_uv, tool_back_uv) -> qt.QPixmap:
+        """Return a copy of pixmap with:
+          - a yellow dotted trajectory line from tip_uv to guidance_uv, and
+          - a blue tapered needle body that comes to a sharp pixel-perfect
+            point exactly at tip_uv, widening to 4px at tool_back_uv.
+
+        Foreshortening sentinel: when tip / guidance / tool_back are all the
+        same point, the tool is aimed nearly straight at the camera and we
+        draw a single blue dot at tip_uv instead of trying to render a line.
+        """
+        if (
+            tip_uv is not None
+            and guidance_uv is not None
+            and tool_back_uv is not None
+            and abs(float(tip_uv[0]) - float(guidance_uv[0])) < 0.1
+            and abs(float(tip_uv[1]) - float(guidance_uv[1])) < 0.1
+            and abs(float(tip_uv[0]) - float(tool_back_uv[0])) < 0.1
+            and abs(float(tip_uv[1]) - float(tool_back_uv[1])) < 0.1
+        ):
+            result = qt.QPixmap(pixmap)
+            painter = qt.QPainter()
+            if not painter.begin(result):
+                return pixmap
+            try:
+                painter.setRenderHint(qt.QPainter.Antialiasing, True)
+                painter.setBrush(qt.QBrush(qt.QColor(79, 134, 255)))
+                painter.setPen(qt.Qt.NoPen)
+                painter.drawEllipse(
+                    qt.QPointF(float(tip_uv[0]), float(tip_uv[1])),
+                    10.0, 10.0,
+                )
+            finally:
+                painter.end()
+            return result
+
+        result = qt.QPixmap(pixmap)
+        painter = qt.QPainter()
+        if not painter.begin(result):
+            return pixmap
+        try:
+            painter.setRenderHint(qt.QPainter.Antialiasing, True)
+
+            # Yellow dotted trajectory line — drawn first so the needle body sits on top.
+            if tip_uv is not None and guidance_uv is not None:
+                pen = qt.QPen(qt.QColor(255, 215, 64))
+                pen.setWidth(2)
+                pen.setStyle(qt.Qt.DotLine)
+                pen.setCapStyle(qt.Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(
+                    int(round(tip_uv[0])), int(round(tip_uv[1])),
+                    int(round(guidance_uv[0])), int(round(guidance_uv[1])),
+                )
+
+            # Blue tapered needle body — filled triangle from a 4px-wide back
+            # at tool_back_uv to a sharp 0px point at tip_uv.
+            if tip_uv is not None and tool_back_uv is not None:
+                dx = float(tip_uv[0]) - float(tool_back_uv[0])
+                dy = float(tip_uv[1]) - float(tool_back_uv[1])
+                length = (dx * dx + dy * dy) ** 0.5
+                if length > 1e-6:
+                    nx = dx / length
+                    ny = dy / length
+                    # Perpendicular (90° rotation): (-ny, nx), scaled by 5px.
+                    px = -ny * 5.0
+                    py = nx * 5.0
+                    polygon = qt.QPolygonF()
+                    polygon.append(qt.QPointF(
+                        float(tool_back_uv[0]) + px,
+                        float(tool_back_uv[1]) + py,
+                    ))
+                    polygon.append(qt.QPointF(
+                        float(tool_back_uv[0]) - px,
+                        float(tool_back_uv[1]) - py,
+                    ))
+                    polygon.append(qt.QPointF(float(tip_uv[0]), float(tip_uv[1])))
+                    polygon.append(qt.QPointF(float(tip_uv[0]), float(tip_uv[1])))
+                    painter.setPen(qt.Qt.NoPen)
+                    painter.setBrush(qt.QBrush(qt.QColor(79, 134, 255)))
+                    painter.drawPolygon(polygon)
+        finally:
+            painter.end()
+        return result
+
+    # --- Per-view state for the X-ray controls toolbar --------------------
+
+    def _default_2d_view_state(self) -> dict:
+        return {
+            "zoom": 1.0,
+            "rotation_deg": 0,
+            "brightness": 0,    # -100..100, additive
+            "contrast": 100,    # %, multiplicative around mid-gray
+            "window": 1.0,      # 0.1..4.0, scale of the intensity window
+            "level": 0.5,       # 0..1, fractional centre
+            "inverted": False,
+        }
+
+    def _get_2d_view_state(self, is_ap: bool) -> dict:
+        return self._2d_ap_view_state if is_ap else self._2d_lp_view_state
+
+    def _invalidate_2d_processed_pixmap(self, is_ap: bool):
+        if is_ap:
+            self._2d_ap_processed_pixmap = None
+            self._2d_ap_base_gen += 1
+        else:
+            self._2d_lp_processed_pixmap = None
+            self._2d_lp_base_gen += 1
+
+    def _compute_2d_processed_pixmap(self, is_ap: bool) -> Optional[qt.QPixmap]:
+        """Apply brightness/contrast/window-level/invert to the cached base
+        array and return a QPixmap. Cached so we only recompute when the
+        relevant state changes (rotation and zoom are applied later, on the
+        scaled pixmap, since they are pure geometry)."""
+        cached = self._2d_ap_processed_pixmap if is_ap else self._2d_lp_processed_pixmap
+        if cached is not None and not cached.isNull():
+            return cached
+        base_arr = self._2d_ap_base_array if is_ap else self._2d_lp_base_array
+        # If we never managed to cache a numpy array (e.g. PIL/QPixmap fallback
+        # failed), fall back to the raw pixmap so zoom/rotate still work.
+        if base_arr is None:
+            return self._2d_ap_pixmap if is_ap else self._2d_lp_pixmap
+        state = self._get_2d_view_state(is_ap)
+        arr = base_arr.astype(np.float32)
+        window = float(state["window"])
+        level = float(state["level"])
+        if abs(window - 1.0) > 1e-6 or abs(level - 0.5) > 1e-6:
+            normalized = arr / 255.0
+            arr = np.clip((normalized - level) / max(window, 1e-6) + 0.5, 0.0, 1.0) * 255.0
+        c = float(state["contrast"]) / 100.0
+        if abs(c - 1.0) > 1e-6:
+            arr = (arr - 128.0) * c + 128.0
+        b = float(state["brightness"])
+        if abs(b) > 0.5:
+            arr = arr + b
+        if state["inverted"]:
+            arr = 255.0 - arr
+        arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+        arr = np.ascontiguousarray(arr)
+        pixmap = self._numpy_to_pixmap(arr)
+        if pixmap is None or pixmap.isNull():
+            pixmap = self._2d_ap_pixmap if is_ap else self._2d_lp_pixmap
+        if is_ap:
+            self._2d_ap_processed_pixmap = pixmap
+        else:
+            self._2d_lp_processed_pixmap = pixmap
+        return pixmap
+
+    def _apply_rotation_to_uv(self, uv, rot_deg: int, W: int, H: int):
+        """Map (u, v) pixel coordinates from the un-rotated base pixmap into
+        the rotated pixmap of dimensions:
+          0/180°: (W, H)   ;   90/270°: (H, W)
+        """
+        u, v = uv
+        rot_deg = rot_deg % 360
+        if rot_deg == 0:
+            return u, v
+        if rot_deg == 90:
+            return H - v, u
+        if rot_deg == 180:
+            return W - u, H - v
+        if rot_deg == 270:
+            return v, W - u
+        return u, v
+
+    def _refresh_2d_overlay(self, is_ap: bool):
+        """Build the displayed pixmap for the AP or LP view:
+            base_array  →  BCWL/invert (cached processed pixmap)
+                        →  rotate
+                        →  fit to label * zoom
+                        →  draw projection overlay
+        """
+        label = self._2d_ap_view_label if is_ap else self._2d_lp_view_label
+        P = self._2d_P_ap if is_ap else self._2d_P_lp
+        if label is None:
+            return
+        base_pixmap = self._compute_2d_processed_pixmap(is_ap)
+        if base_pixmap is None or base_pixmap.isNull():
+            return
+        state = self._get_2d_view_state(is_ap)
+        rotation = int(state["rotation_deg"]) % 360
+        available = label.size
+        target_w = max(available.width(), 240)
+        target_h = max(available.height(), 280)
+        zoom = max(0.2, float(state["zoom"]))
+
+        # The rotate + scale of the full X-ray is by far the most expensive
+        # step here, and at ~30 FPS it would otherwise run on every tracking
+        # tick even though its inputs (the BCWL-processed base image, rotation,
+        # label size and zoom) almost never change frame-to-frame. Cache the
+        # result keyed on those inputs; the per-view generation counter bumps
+        # whenever the processed base image is rebuilt or invalidated, so
+        # BCWL/invert edits and new X-ray frames rebuild it exactly once. Only
+        # the cheap needle overlay below redraws per frame, so live tracking
+        # is unaffected.
+        base_gen = self._2d_ap_base_gen if is_ap else self._2d_lp_base_gen
+        cache_key = (base_gen, rotation, target_w, target_h, round(zoom, 4))
+        cached_scaled = self._2d_ap_scaled_cache if is_ap else self._2d_lp_scaled_cache
+        cached_rotated = self._2d_ap_rotated_cache if is_ap else self._2d_lp_rotated_cache
+        cached_key = self._2d_ap_scaled_key if is_ap else self._2d_lp_scaled_key
+        if (
+            cached_scaled is not None
+            and not cached_scaled.isNull()
+            and cached_rotated is not None
+            and cached_key == cache_key
+        ):
+            rotated = cached_rotated
+            scaled = cached_scaled
+        else:
+            if rotation != 0:
+                transform = qt.QTransform()
+                transform.rotate(rotation)
+                rotated = base_pixmap.transformed(transform, qt.Qt.SmoothTransformation)
+            else:
+                rotated = base_pixmap
+            scaled = rotated.scaled(
+                int(target_w * zoom), int(target_h * zoom),
+                qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation,
+            )
+            if is_ap:
+                self._2d_ap_rotated_cache = rotated
+                self._2d_ap_scaled_cache = scaled
+                self._2d_ap_scaled_key = cache_key
+            else:
+                self._2d_lp_rotated_cache = rotated
+                self._2d_lp_scaled_cache = scaled
+                self._2d_lp_scaled_key = cache_key
+        if P is None:
+            label.setPixmap(scaled)
+            return
+        endpoints = self._compute_2d_projected_endpoints(P, view_label="AP" if is_ap else "LP")
+        if endpoints is None:
+            label.setPixmap(scaled)
+            return
+        tip_uv, guidance_uv, tool_back_uv = endpoints
+        base_w = max(base_pixmap.width(), 1)
+        base_h = max(base_pixmap.height(), 1)
+        tip_uv = self._apply_rotation_to_uv(tip_uv, rotation, base_w, base_h)
+        if guidance_uv is not None:
+            guidance_uv = self._apply_rotation_to_uv(guidance_uv, rotation, base_w, base_h)
+        if tool_back_uv is not None:
+            tool_back_uv = self._apply_rotation_to_uv(tool_back_uv, rotation, base_w, base_h)
+        rot_w = max(rotated.width(), 1)
+        rot_h = max(rotated.height(), 1)
+        sx = scaled.width() / float(rot_w)
+        sy = scaled.height() / float(rot_h)
+        tip_uv_s = (tip_uv[0] * sx, tip_uv[1] * sy)
+        guidance_uv_s = (
+            (guidance_uv[0] * sx, guidance_uv[1] * sy)
+            if guidance_uv is not None else None
+        )
+        tool_back_uv_s = (
+            (tool_back_uv[0] * sx, tool_back_uv[1] * sy)
+            if tool_back_uv is not None else None
+        )
+        composed = self._paint_needle_overlay(scaled, tip_uv_s, guidance_uv_s, tool_back_uv_s)
+        label.setPixmap(composed)
+
+    def _start_2d_tracking_timer(self):
+        if self._2d_tracking_timer is not None:
+            return
+        self._2d_last_tick_token = None  # force the first tick to paint
+        timer = qt.QTimer()
+        timer.setInterval(33)  # ~30 FPS overlay refresh
+        timer.timeout.connect(self._on_2d_tracking_tick)
+        timer.start()
+        self._2d_tracking_timer = timer
+
+    def _stop_2d_tracking_timer(self):
+        if self._2d_tracking_timer is None:
+            return
+        try:
+            self._2d_tracking_timer.stop()
+        except Exception:
+            pass
+        self._2d_tracking_timer = None
+
+    def _on_2d_tracking_tick(self):
+        """Redraw the AP/LP overlays from the current PointerToPhantom pose.
+        No-ops gracefully when the page is hidden or matrices are missing."""
+        if self._shell_stack is None:
+            self._stop_2d_tracking_timer()
+            return
+        try:
+            if self._shell_stack.currentIndex != self._shell_2d_2d_page_index:
+                return
+        except Exception:
+            return
+        # Skip the repaint when nothing changed since the last tick: the
+        # tracker only delivers a few poses per second (ImageIntegrationTime
+        # 130ms) while this timer fires at ~30 FPS, so most ticks would
+        # redraw a pixel-identical frame (2 scene lookups + 2 full-size
+        # pixmap copies each). Label sizes are part of the token so window
+        # resizes still repaint; interactive controls (zoom/pan/B/C/W-L/
+        # rotate/new X-ray) bypass this by calling _refresh_2d_overlay
+        # directly.
+        try:
+            mat = self._get_live_pointer_to_phantom_matrix()
+            ap_lbl = self._2d_ap_view_label
+            lp_lbl = self._2d_lp_view_label
+            token = (
+                mat.tobytes() if mat is not None else None,
+                (int(ap_lbl.width), int(ap_lbl.height)) if ap_lbl is not None else None,
+                (int(lp_lbl.width), int(lp_lbl.height)) if lp_lbl is not None else None,
+            )
+            if token == self._2d_last_tick_token:
+                return
+            self._2d_last_tick_token = token
+        except Exception:
+            pass  # on any doubt, fall through and repaint
+        try:
+            if self._2d_P_ap is not None and self._2d_ap_pixmap is not None:
+                self._refresh_2d_overlay(is_ap=True)
+            if self._2d_P_lp is not None and self._2d_lp_pixmap is not None:
+                self._refresh_2d_overlay(is_ap=False)
+        except Exception:
+            logging.exception("2D-2D overlay refresh failed")
+
+    # --- 2D-2D per-view controls toolbar ----------------------------------
+
+    def _create_2d_view_toolbar(self, is_ap: bool) -> qt.QWidget:
+        """Compact horizontal toolbar that lives directly under each view's
+        title — Zoom +/-, Pan, Reset, B, C, Invert, Rotate 90°, W/L."""
+        bar = qt.QFrame()
+        bar.setObjectName("TwoDViewToolbar")
+        layout = qt.QHBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addStretch(1)
+
+        def add(text: str, tip: str, handler):
+            btn = qt.QToolButton()
+            btn.setObjectName("TwoDViewToolButton")
+            btn.setText(text)
+            btn.setToolTip(tip)
+            btn.setCursor(qt.Qt.PointingHandCursor)
+            btn.clicked.connect(handler)
+            layout.addWidget(btn)
+            return btn
+
+        add("+",      "Zoom in",         lambda: self._on_2d_zoom(is_ap, 1.25))
+        add("−",      "Zoom out",        lambda: self._on_2d_zoom(is_ap, 1.0 / 1.25))
+        add("Pan",    "Pan (use the scroll wheel or arrow keys when zoomed)",
+                                          lambda: self._on_2d_pan(is_ap))
+        add("Reset",  "Reset view",      lambda: self._on_2d_reset_view(is_ap))
+        add("B",      "Brightness",      lambda: self._on_2d_brightness(is_ap))
+        add("C",      "Contrast",        lambda: self._on_2d_contrast(is_ap))
+        add("Invert", "Invert X-ray",    lambda: self._on_2d_invert(is_ap))
+        add("↻",      "Rotate 90°",      lambda: self._on_2d_rotate_90(is_ap))
+        add("W/L",    "Window / Level",  lambda: self._on_2d_window_level(is_ap))
+
+        layout.addStretch(1)
+        return bar
+
+    # --- Toolbar handlers -------------------------------------------------
+
+    def _on_2d_zoom(self, is_ap: bool, factor: float):
+        state = self._get_2d_view_state(is_ap)
+        state["zoom"] = max(0.2, min(8.0, state["zoom"] * factor))
+        self._refresh_2d_overlay(is_ap)
+
+    def _on_2d_rotate_90(self, is_ap: bool):
+        state = self._get_2d_view_state(is_ap)
+        state["rotation_deg"] = (state["rotation_deg"] + 90) % 360
+        self._refresh_2d_overlay(is_ap)
+
+    def _on_2d_invert(self, is_ap: bool):
+        state = self._get_2d_view_state(is_ap)
+        state["inverted"] = not state["inverted"]
+        self._invalidate_2d_processed_pixmap(is_ap)
+        self._refresh_2d_overlay(is_ap)
+
+    def _on_2d_reset_view(self, is_ap: bool):
+        if is_ap:
+            self._2d_ap_view_state = self._default_2d_view_state()
+        else:
+            self._2d_lp_view_state = self._default_2d_view_state()
+        self._invalidate_2d_processed_pixmap(is_ap)
+        self._refresh_2d_overlay(is_ap)
+
+    def _on_2d_pan(self, is_ap: bool):
+        self._set_2d_status(
+            "Pan: use Zoom +/− to magnify and Reset to recenter "
+            "(drag-pan is on the roadmap)."
+        )
+
+    def _on_2d_brightness(self, is_ap: bool):
+        state = self._get_2d_view_state(is_ap)
+        self._show_2d_single_slider_dialog(
+            is_ap, "Brightness", -100, 100, int(state["brightness"]),
+            "brightness", scale=1.0, fmt="{value:+d}",
+        )
+
+    def _on_2d_contrast(self, is_ap: bool):
+        state = self._get_2d_view_state(is_ap)
+        self._show_2d_single_slider_dialog(
+            is_ap, "Contrast", 10, 300, int(state["contrast"]),
+            "contrast", scale=1.0, fmt="{value}%",
+        )
+
+    def _on_2d_window_level(self, is_ap: bool):
+        self._show_2d_window_level_dialog(is_ap)
+
+    # --- Slider dialogs ---------------------------------------------------
+
+    def _show_2d_single_slider_dialog(self, is_ap: bool, title: str,
+                                       vmin: int, vmax: int, initial: int,
+                                       state_key: str, scale: float = 1.0,
+                                       fmt: str = "{value}"):
+        dlg = qt.QDialog(self._active_modal_parent())
+        dlg.setWindowTitle(f"{'AP' if is_ap else 'LP'} — {title}")
+        dlg.setWindowFlags(qt.Qt.Dialog | qt.Qt.WindowStaysOnTopHint)
+        dlg.setModal(False)
+        layout = qt.QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        value_label = qt.QLabel(fmt.format(value=initial))
+        value_label.setAlignment(qt.Qt.AlignCenter)
+        layout.addWidget(value_label)
+
+        slider = qt.QSlider(qt.Qt.Horizontal)
+        slider.setMinimum(vmin)
+        slider.setMaximum(vmax)
+        slider.setValue(initial)
+        layout.addWidget(slider)
+
+        def on_change(v):
+            self._get_2d_view_state(is_ap)[state_key] = v * scale
+            self._invalidate_2d_processed_pixmap(is_ap)
+            value_label.setText(fmt.format(value=v))
+            self._refresh_2d_overlay(is_ap)
+        slider.valueChanged.connect(on_change)
+
+        close_btn = qt.QPushButton("Close")
+        close_btn.clicked.connect(lambda *_: dlg.close())
+        layout.addWidget(close_btn)
+
+        dlg.resize(320, 120)
+        dlg.show()
+        dlg.raise_()
+
+    def _show_2d_window_level_dialog(self, is_ap: bool):
+        state = self._get_2d_view_state(is_ap)
+        dlg = qt.QDialog(self._active_modal_parent())
+        dlg.setWindowTitle(f"{'AP' if is_ap else 'LP'} — Window / Level")
+        dlg.setWindowFlags(qt.Qt.Dialog | qt.Qt.WindowStaysOnTopHint)
+        dlg.setModal(False)
+        layout = qt.QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        w_label = qt.QLabel(f"Window: {state['window']:.2f}")
+        layout.addWidget(w_label)
+        w_slider = qt.QSlider(qt.Qt.Horizontal)
+        w_slider.setMinimum(10)   # 0.10
+        w_slider.setMaximum(400)  # 4.00
+        w_slider.setValue(int(state['window'] * 100))
+        layout.addWidget(w_slider)
+
+        l_label = qt.QLabel(f"Level: {state['level']:.2f}")
+        layout.addWidget(l_label)
+        l_slider = qt.QSlider(qt.Qt.Horizontal)
+        l_slider.setMinimum(0)
+        l_slider.setMaximum(100)
+        l_slider.setValue(int(state['level'] * 100))
+        layout.addWidget(l_slider)
+
+        # Re-fetch the state dict on every change: "Reset view" replaces the
+        # whole dict, so a closure over the dict captured at dialog-open time
+        # would silently write into an orphaned copy afterwards.
+        def on_w(v):
+            live_state = self._get_2d_view_state(is_ap)
+            live_state['window'] = v / 100.0
+            w_label.setText(f"Window: {live_state['window']:.2f}")
+            self._invalidate_2d_processed_pixmap(is_ap)
+            self._refresh_2d_overlay(is_ap)
+        def on_l(v):
+            live_state = self._get_2d_view_state(is_ap)
+            live_state['level'] = v / 100.0
+            l_label.setText(f"Level: {live_state['level']:.2f}")
+            self._invalidate_2d_processed_pixmap(is_ap)
+            self._refresh_2d_overlay(is_ap)
+        w_slider.valueChanged.connect(on_w)
+        l_slider.valueChanged.connect(on_l)
+
+        close_btn = qt.QPushButton("Close")
+        close_btn.clicked.connect(lambda *_: dlg.close())
+        layout.addWidget(close_btn)
+
+        dlg.resize(320, 200)
+        dlg.show()
+        dlg.raise_()
+
+    def _active_modal_parent(self):
+        """Parent for modal dialogs so they appear on top of the currently
+        visible full-screen shell window rather than on the hidden Slicer main
+        window (which would leak the dialog onto the bare desktop).
+        """
+        try:
+            if self._shell_dialog is not None and self._shell_dialog.isVisible():
+                return self._shell_dialog
+        except Exception:
+            pass
+        return slicer.util.mainWindow()
+
+    def _on_2d_init_tracking_clicked(self):
+        try:
+            self._set_2d_status("Starting PlusServer …")
+            self._on_initialize_tracking_clicked()
+            self._set_2d_status("PlusServer launched. Click Start Tracking to begin the overlay.")
+        except Exception as exc:
+            logging.exception("2D-2D init tracking failed")
+            self._set_2d_status(f"Init tracking failed: {exc}")
+
+    def _on_2d_start_tracking_clicked(self):
+        # Start the overlay refresh loop. The tick is a no-op while the
+        # PointerToPhantom node has not appeared yet, so it is safe to
+        # start even before PlusServer has finished announcing tools — this
+        # also lets the user start the 2D-2D overlay when PlusServer was
+        # launched from the 2D-3D or 3D-3D workflow instead of from here.
+        try:
+            self._start_2d_tracking_timer()
+            self._set_2d_status("Tracking started.")
+        except Exception as exc:
+            logging.exception("2D-2D start tracking failed")
+            self._set_2d_status(f"Start tracking failed: {exc}")
+
+    def _on_2d_2d_back_clicked(self):
+        # Stop the overlay loop as soon as the page is leaving so we do not
+        # continue polling the MRML scene while on the landing page.
+        self._stop_2d_tracking_timer()
+        # Return to the landing page inside the same shell window.
+        if self._shell_stack is not None:
+            self._shell_stack.setCurrentIndex(self._shell_landing_page_index)
+        self._registration_mode = ""
+
+    def _quit_application(self):
+        """Close the registration shell and quit the whole application.
+
+        Used by the landing page's Close button. Quitting through the normal
+        application path lets the registered aboutToQuit handlers run (e.g.
+        shutting down the PLUS server)."""
+        self._stop_2d_tracking_timer()
+        self._registration_mode_selected = True
+        if self._shell_dialog is not None:
+            try:
+                self._shell_dialog.close()
+            except Exception:
+                pass
+        try:
+            slicer.util.quit()
+        except Exception:
+            try:
+                slicer.app.quit()
+            except Exception:
+                try:
+                    qt.QApplication.quit()
+                except Exception:
+                    pass
+
+    def _show_registration_mode_dialog(self):
+        """Professional full-screen page letting the user pick a registration mode.
+
+        2D-2D is a placeholder (under development); 2D-3D and 3D-3D both open
+        the existing workflow as-is.
+        """
+        if self._registration_mode_selected:
+            return
+        try:
+            self._build_and_exec_registration_mode_dialog()
+        except Exception:
+            logging.exception("Failed to show registration mode page")
+            self._registration_mode_selected = True
+
+    def _build_and_exec_registration_mode_dialog(self):
+        """Build the single shell window that hosts both the landing page
+        and the 2D-2D registration page via a QStackedWidget, and run its
+        modal event loop. Only ONE top-level window is ever created, so
+        the Task View / Alt-Tab shows a single tile regardless of which
+        page is active.
+        """
+        parent_window = slicer.util.mainWindow()
+        dialog = qt.QDialog()
+        dialog.setWindowTitle("TrackVision")
+        dialog.setModal(True)
+        # NOTE: No WindowStaysOnTopHint here. The landing + 2D-2D pages live in
+        # this frameless full-screen shell; keeping it always-on-top would pin it
+        # above every other application and stop the user from Alt-Tabbing /
+        # switching to another window or tab. The 3D-3D workflow uses the normal
+        # Slicer main window (no always-on-top), which is why switching worked
+        # there but not here.
+        dialog.setWindowFlags(
+            qt.Qt.Window | qt.Qt.FramelessWindowHint
+        )
+        # Combined stylesheet for both pages (landing + 2D-2D). Applied at the
+        # shell dialog level so all descendant widgets pick it up.
+        dialog.setStyleSheet(
+            "QDialog { background: #000000; }"
+            # --- Landing page styling ---
+            "QFrame#RegHeaderBar {"
+            "  background: transparent;"
+            "  border: none;"
+            "  border-bottom: 1px solid #1b2a44;"
+            "}"
+            "QLabel#RegBrand {"
+            "  font-size: 20px; font-weight: 800; color: #ffffff; letter-spacing: 1px;"
+            "}"
+            "QLabel#RegTagline {"
+            "  font-size: 12px; color: #6a81a8; letter-spacing: 2px;"
+            "}"
+            "QLabel#RegEyebrow {"
+            "  font-size: 11px; color: #4f86ff; font-weight: 700; letter-spacing: 4px;"
+            "}"
+            "QLabel#RegTitle {"
+            "  font-size: 32px; font-weight: 800; color: #ffffff; letter-spacing: 1px;"
+            "}"
+            "QLabel#RegSubtitle { font-size: 14px; color: #9fb4d8; }"
+            "QFrame#RegModeCard {"
+            "  background: #141414;"
+            "  border: 1px solid #242424;"
+            "  border-radius: 26px;"
+            "}"
+            "QToolButton#RegModeButton {"
+            "  background: transparent;"
+            "  border: 1px solid transparent;"
+            "  border-radius: 26px;"
+            "}"
+            "QToolButton#RegModeButton:hover {"
+            "  border: 2px solid #565656;"
+            "}"
+            "QToolButton#RegModeButton:pressed { background: rgba(255, 255, 255, 12); }"
+            "QLabel#RegModeImage { background: transparent; }"
+            "QLabel#RegModeTitle {"
+            "  color: #ffffff;"
+            "  font-size: 30px;"
+            "  font-weight: 500;"
+            "  letter-spacing: 1px;"
+            "  background: transparent;"
+            "}"
+            "QLabel#RegModeDescription { font-size: 12px; color: #8a9ec4; }"
+            "QLabel#RegStatusAvailable {"
+            "  background: rgba(42, 160, 110, 40);"
+            "  color: #5ddca5;"
+            "  border: 1px solid rgba(42, 160, 110, 120);"
+            "  border-radius: 10px;"
+            "  padding: 4px 14px;"
+            "  font-size: 11px; font-weight: 700; letter-spacing: 2px;"
+            "}"
+            "QLabel#RegStatusPending {"
+            "  background: rgba(240, 160, 64, 40);"
+            "  color: #f5bb6b;"
+            "  border: 1px solid rgba(240, 160, 64, 130);"
+            "  border-radius: 10px;"
+            "  padding: 4px 14px;"
+            "  font-size: 11px; font-weight: 700; letter-spacing: 2px;"
+            "}"
+            "QLabel#RegFooter { color: #4a5c7a; font-size: 11px; letter-spacing: 2px; }"
+            "QLabel#RegStatusMessage { color: #f5bb6b; font-size: 13px; font-weight: 600; }"
+            # --- Shell close button (landing + 2D-2D pages) ---
+            "QPushButton#ShellCloseButton {"
+            "  background: transparent;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #2a3a55;"
+            "  border-radius: 8px;"
+            "  padding: 6px 16px;"
+            "  font-weight: 700;"
+            "  letter-spacing: 1px;"
+            "}"
+            "QPushButton#ShellCloseButton:hover {"
+            "  background: #3a1320; color: #ff7676; border-color: #ff7676;"
+            "}"
+            "QPushButton#ShellCloseButton:pressed { background: #2a0e18; }"
+            # --- 2D-2D page styling ---
+            "QFrame#TwoDTopBar {"
+            "  background: #000000;"
+            "  border-bottom: 1px solid #1b2a44;"
+            "}"
+            "QLabel#TwoDTitle {"
+            "  color: #ffffff; font-size: 19px; font-weight: 700; letter-spacing: 1px;"
+            "}"
+            "QLabel#TwoDViewTitle {"
+            "  color: #9fb4d8; font-size: 14px; font-weight: 700; letter-spacing: 3px;"
+            "}"
+            "QFrame#TwoDViewFrame {"
+            "  background: #000000;"
+            "  border: 1px solid #1b2a44;"
+            "  border-radius: 10px;"
+            "}"
+            "QLabel#TwoDViewImage {"
+            "  background: #000000; color: #4a5c7a; font-size: 13px;"
+            "}"
+            "QFrame#TwoDViewToolbar { background: transparent; border: none; }"
+            "QToolButton#TwoDViewToolButton {"
+            "  background: #000000;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #24385c;"
+            "  border-radius: 8px;"
+            "  padding: 8px 16px;"
+            "  font-size: 15px;"
+            "  font-weight: 700;"
+            "  letter-spacing: 1px;"
+            "  min-height: 34px;"
+            "}"
+            "QToolButton#TwoDViewToolButton:hover {"
+            "  color: #ffffff; border-color: #4f86ff;"
+            "}"
+            "QToolButton#TwoDViewToolButton:pressed {"
+            "  background: #0a1428;"
+            "}"
+            "QFrame#TwoDSidebar {"
+            "  background: #000000;"
+            "  border-left: 1px solid #1b2a44;"
+            "}"
+            "QLabel#TwoDSectionLabel {"
+            "  color: #9fb4d8; font-size: 14px; font-weight: 700; letter-spacing: 2px;"
+            "  padding-top: 6px;"
+            "}"
+            "QPushButton#TwoDActionButton {"
+            "  background: #000000;"
+            "  color: #ffffff;"
+            "  border: 1px solid #3a7dde;"
+            "  border-radius: 14px;"
+            "  padding: 14px 16px;"
+            "  font-size: 15px;"
+            "  font-weight: 600;"
+            "  min-height: 40px;"
+            "  text-align: center;"
+            "}"
+            "QPushButton#TwoDActionButton:hover {"
+            "  border: 2px solid #7aa7ff; color: #ffffff;"
+            "}"
+            "QPushButton#TwoDActionButton:disabled {"
+            "  color: #4a5c7a; border-color: #2a3a55;"
+            "}"
+            "QPushButton#TwoDInitButton {"
+            "  background: #4f86ff;"
+            "  color: #000000;"
+            "  border: 2px solid #4f86ff;"
+            "  border-radius: 14px;"
+            "  padding: 16px 14px;"
+            "  font-size: 16px; font-weight: 800; letter-spacing: 1px;"
+            "  min-height: 42px;"
+            "}"
+            "QPushButton#TwoDInitButton:hover {"
+            "  background: #6a9bff; border-color: #6a9bff;"
+            "}"
+            "QPushButton#TwoDBackButton {"
+            "  background: transparent;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #2a3a55;"
+            "  border-radius: 8px;"
+            "  padding: 6px 14px;"
+            "  font-weight: 600;"
+            "}"
+            "QPushButton#TwoDBackButton:hover {"
+            "  background: #1b2a44; color: #ffffff; border-color: #3a7dde;"
+            "}"
+            "QLabel#TwoDPathLabel { color: #6a81a8; font-size: 13px; }"
+            "QLabel#TwoDStatus { color: #9fb4d8; font-size: 14px; }"
+        )
+
+        # The shell holds a QStackedWidget; pages are swapped in-place,
+        # so only one top-level window exists throughout.
+        shell_layout = qt.QVBoxLayout(dialog)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        stack = qt.QStackedWidget()
+        shell_layout.addWidget(stack, 1)
+
+        # Build page 0: landing (three mode cards)
+        landing_page = self._build_landing_page_widget(dialog, parent_window)
+        self._shell_landing_page_index = stack.addWidget(landing_page)
+
+        # Build page 1: 2D-2D registration
+        page_2d_2d = self._build_2d_2d_page_widget()
+        self._shell_2d_2d_page_index = stack.addWidget(page_2d_2d)
+
+        stack.setCurrentIndex(self._shell_landing_page_index)
+
+        self._shell_dialog = dialog
+        self._shell_stack = stack
+
+        # Show fullscreen, then hide the Slicer main window so no Slicer
+        # chrome shows around the edges.
+        dialog.showFullScreen()
+        dialog.raise_()
+        dialog.activateWindow()
+        try:
+            qt.QApplication.processEvents()
+        except Exception:
+            pass
+        if parent_window is not None:
+            try:
+                parent_window.hide()
+            except Exception:
+                pass
+        self._remove_startup_overlay()
+        try:
+            dialog.exec()
+        finally:
+            self._remove_startup_overlay()
+            self._stop_2d_tracking_timer()
+            self._shell_dialog = None
+            self._shell_stack = None
+
+    def _build_landing_page_widget(self, dialog: qt.QDialog,
+                                   parent_window) -> qt.QWidget:
+        """Build the landing page (three mode cards) as a QWidget that lives
+        inside the shell's stacked widget."""
+        page = qt.QWidget()
+        page_layout = qt.QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        # Margined content area (cards, header). The footer is added to the
+        # page layout below so it spans the full width, flush to the bottom.
+        # --- Full-width top bar: logo (left) + close (right), with a bottom
+        # divider line that mirrors the footer's top divider line. ---
+        top_bar = qt.QFrame()
+        top_bar.setObjectName("RegTopBar")
+        top_bar.setStyleSheet(
+            "QFrame#RegTopBar {"
+            "  background: #0a0a0a;"
+            "  border-bottom: 1px solid #242424;"
+            "}"
+            "QLabel#RegHeaderLogo { background: transparent; }"
+        )
+        top_row = qt.QHBoxLayout(top_bar)
+        top_row.setContentsMargins(28, 14, 28, 14)
+        top_row.setSpacing(12)
+
+        logo_label = qt.QLabel()
+        logo_label.setObjectName("RegHeaderLogo")
+        try:
+            logo_pm = qt.QPixmap(self.resourcePath(os.path.join("Images", "header_logo.png")))
+            if not logo_pm.isNull():
+                logo_label.setPixmap(logo_pm.scaledToHeight(64, qt.Qt.SmoothTransformation))
+        except Exception:
+            pass
+        top_row.addWidget(logo_label, 0, qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
+
+        top_row.addStretch(1)
+
+        # Centre: prompt (font matched to the 2D/3D card labels)
+        prompt = qt.QLabel("Select a navigation mode to continue.")
+        prompt.setObjectName("RegModePrompt")
+        prompt.setAlignment(qt.Qt.AlignCenter)
+        prompt.setStyleSheet(
+            "QLabel#RegModePrompt {"
+            "  color: #ffffff;"
+            "  font-size: 30px;"
+            "  font-weight: 500;"
+            "  letter-spacing: 1px;"
+            "  background: transparent;"
+            "}"
+        )
+        top_row.addWidget(prompt, 0, qt.Qt.AlignVCenter)
+
+        top_row.addStretch(1)
+        close_button = qt.QPushButton("✕  Close")
+        close_button.setObjectName("ShellCloseButton")
+        close_button.setCursor(qt.Qt.PointingHandCursor)
+        close_button.setToolTip("Close the application.")
+        close_button.clicked.connect(lambda _checked=False: self._quit_application())
+        top_row.addWidget(close_button, 0, qt.Qt.AlignVCenter)
+
+        page_layout.addWidget(top_bar, 0)
+
+        content = qt.QWidget()
+        page_layout.addWidget(content, 1)
+
+        outer = qt.QVBoxLayout(content)
+        outer.setContentsMargins(32, 24, 32, 8)
+        outer.setSpacing(20)
+
+        outer.addStretch(1)
+
+        # --- Mode cards ---
+        button_row = qt.QHBoxLayout()
+        button_row.setSpacing(24)
+        button_row.addStretch(1)
+
+        def _make_mode_card(title_text: str, description: str, tooltip: str,
+                            icon_pixmap: qt.QPixmap, available: bool):
+            card_w, card_h = 560, 560
+
+            # Outer container stacks the card and, below it, the title label.
+            container = qt.QWidget()
+            container_layout = qt.QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(18)
+
+            card = qt.QFrame()
+            card.setObjectName("RegModeCard")
+            card.setFixedSize(card_w, card_h)
+
+            card_layout = qt.QVBoxLayout(card)
+            card_layout.setContentsMargins(28, 28, 28, 28)
+            card_layout.setSpacing(0)
+
+            image_label = qt.QLabel()
+            image_label.setObjectName("RegModeImage")
+            image_label.setAlignment(qt.Qt.AlignCenter)
+            if icon_pixmap is not None and not icon_pixmap.isNull():
+                image_label.setPixmap(icon_pixmap)
+            card_layout.addWidget(image_label, 1)
+
+            # Whole-card clickable surface laid over the image. Keeping a
+            # QToolButton means the callers still connect to `clicked`; its
+            # transparent background lets the image show through.
+            btn = qt.QToolButton(card)
+            btn.setObjectName("RegModeButton")
+            btn.setCursor(qt.Qt.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            btn.setGeometry(0, 0, card_w, card_h)
+            btn.raise_()
+
+            container_layout.addWidget(card, 0, qt.Qt.AlignHCenter)
+
+            # Title sits BELOW the card (outside it), like the reference.
+            title = qt.QLabel(title_text)
+            title.setObjectName("RegModeTitle")
+            title.setAlignment(qt.Qt.AlignHCenter)
+            container_layout.addWidget(title, 0)
+
+            return container, btn
+
+        card_2d_2d, btn_2d_2d = _make_mode_card(
+            "2D  –  2D",
+            "Align two 2D radiographs. Fluoroscopy-to-fluoroscopy registration.",
+            "2D to 2D registration.",
+            self._make_mode_icon_2d_2d(),
+            available=True,
+        )
+        card_2d_3d, btn_2d_3d = _make_mode_card(
+            "2D  –  3D",
+            "Register live 2D fluoroscopy against a pre-op CT volume.",
+            "2D to 3D registration — open the tracking workflow.",
+            self._make_mode_icon_2d_3d(),
+            available=True,
+        )
+        button_row.addWidget(card_2d_2d, 0)
+        button_row.addWidget(card_2d_3d, 0)
+        button_row.addStretch(1)
+        outer.addLayout(button_row, 0)
+
+        outer.addSpacing(10)
+
+        status = qt.QLabel("")
+        status.setObjectName("RegStatusMessage")
+        status.setAlignment(qt.Qt.AlignCenter)
+        outer.addWidget(status)
+
+        outer.addStretch(1)
+
+        # Full-width footer flush to the bottom of the page.
+        page_layout.addWidget(self._build_landing_footer(dialog), 0)
+
+        def _accept_with_mode(mode: str):
+            self._registration_mode = mode
+            self._registration_mode_selected = True
+            # Restore the main window UNDERNEATH the still-visible shell so
+            # the workflow is ready before the shell closes — no flash of
+            # empty desktop when the shell dialog is torn down.
+            if parent_window is not None:
+                try:
+                    parent_window.show()
+                    parent_window.raise_()
+                except Exception:
+                    pass
+            dialog.accept()
+
+        def _open_2d_2d_page():
+            # Switch the in-place stacked page — no new window is created,
+            # so the task switcher still shows a single tile.
+            self._registration_mode = "2d_2d"
+            self._show_2d_2d_registration_page()
+
+        btn_2d_2d.clicked.connect(lambda _checked=False: _open_2d_2d_page())
+        btn_2d_3d.clicked.connect(lambda _checked=False: _accept_with_mode("2d_3d"))
+
+        return page
+
+    def _build_landing_footer(self, dialog):
+        """Footer bar for the landing page: live date/time on the left, a
+        status line in the centre, and Documentation / Settings / Help
+        actions on the right."""
+        footer = qt.QFrame()
+        footer.setObjectName("RegFooterBar")
+        footer.setStyleSheet(
+            "QFrame#RegFooterBar {"
+            "  background: #0a0a0a;"
+            "  border-top: 1px solid #242424;"
+            "}"
+            "QLabel#RegFooterText { color: #9a9a9a; font-size: 18px; }"
+            "QLabel#RegFooterStrong { color: #e6e6e6; font-size: 18px; font-weight: 600; }"
+            "QLabel#RegFooterSep { color: #3a3a3a; font-size: 20px; }"
+            "QLabel#RegFooterDot { color: #22c55e; font-size: 20px; }"
+            "QLabel#RegFooterIcon { background: transparent; }"
+            "QPushButton#RegFooterButton {"
+            "  background: transparent; border: none; color: #c4c4c4;"
+            "  font-size: 18px; font-weight: 600; padding: 6px 18px;"
+            "}"
+            "QPushButton#RegFooterButton:hover { color: #ffffff; }"
+        )
+
+        row = qt.QHBoxLayout(footer)
+        # More top than bottom padding nudges the content slightly downward.
+        row.setContentsMargins(40, 24, 40, 14)
+        row.setSpacing(14)
+
+        def _sep():
+            s = qt.QLabel("│")
+            s.setObjectName("RegFooterSep")
+            return s
+
+        def _text(value, strong=False):
+            lbl = qt.QLabel(value)
+            lbl.setObjectName("RegFooterStrong" if strong else "RegFooterText")
+            return lbl
+
+        now = qt.QDateTime.currentDateTime()
+
+        # Left: live date and time
+        self._landing_footer_date = _text(now.toString("d MMM yyyy"), strong=True)
+        self._landing_footer_time = _text(now.toString("h:mm AP"), strong=True)
+        row.addWidget(self._footer_icon_label("footer_date.png", 22), 0)
+        row.addWidget(self._landing_footer_date, 0)
+        row.addWidget(_sep(), 0)
+        row.addWidget(self._footer_icon_label("footer_time.png", 22), 0)
+        row.addWidget(self._landing_footer_time, 0)
+
+        row.addStretch(1)
+
+        # Floating hover hint shown ABOVE the hovered icon. Parented to the
+        # shell dialog (not a native tooltip, which would render behind the
+        # always-on-top fullscreen landing page).
+        self._landing_footer_hint = qt.QLabel(dialog)
+        self._landing_footer_hint.setObjectName("RegFooterHint")
+        self._landing_footer_hint.setStyleSheet(
+            "QLabel#RegFooterHint {"
+            "  background: #2a2a2a;"
+            "  color: #ffffff;"
+            "  font-size: 18px;"
+            "  font-weight: 600;"
+            "  padding: 6px 12px;"
+            "  border-radius: 6px;"
+            "  border: 1px solid #3d3d3d;"
+            "}"
+        )
+        self._landing_footer_hint.hide()
+
+        # Right: actions
+        doc_btn = qt.QPushButton("")
+        doc_btn.setObjectName("RegFooterButton")
+        doc_btn.setCursor(qt.Qt.PointingHandCursor)
+        doc_btn.setToolTip("Documentation")
+        doc_btn.setIcon(qt.QIcon(self._footer_icon_pixmap("footer_document.png", 30)))
+        doc_btn.setIconSize(qt.QSize(30, 30))
+        doc_btn.setProperty("footerHint", "Documentation")
+        doc_btn.installEventFilter(self._get_footer_hover_filter())
+        doc_btn.clicked.connect(
+            lambda _checked=False: qt.QMessageBox.information(
+                dialog,
+                "Documentation",
+                "TrackVision documentation is provided in the project "
+                "README and the Windows/Linux build guides.",
+            )
+        )
+        row.addWidget(doc_btn, 0)
+
+        settings_btn = qt.QPushButton("")
+        settings_btn.setObjectName("RegFooterButton")
+        settings_btn.setCursor(qt.Qt.PointingHandCursor)
+        settings_btn.setToolTip("Settings")
+        try:
+            settings_btn.setIcon(self._tinted_icon("Icons/Gears.png", "#cfcfcf"))
+            settings_btn.setIconSize(qt.QSize(30, 30))
+        except Exception:
+            pass
+        settings_btn.setProperty("footerHint", "Settings")
+        settings_btn.installEventFilter(self._get_footer_hover_filter())
+        settings_btn.clicked.connect(lambda _checked=False: self._safe_open_settings())
+        row.addWidget(settings_btn, 0)
+
+        help_btn = qt.QPushButton("")
+        help_btn.setObjectName("RegFooterButton")
+        help_btn.setCursor(qt.Qt.PointingHandCursor)
+        help_btn.setToolTip("Help")
+        help_btn.setIcon(qt.QIcon(self._footer_icon_pixmap("footer_help.png", 30)))
+        help_btn.setIconSize(qt.QSize(30, 30))
+        help_btn.setProperty("footerHint", "Help")
+        help_btn.installEventFilter(self._get_footer_hover_filter())
+        help_btn.clicked.connect(
+            lambda _checked=False: qt.QMessageBox.information(
+                dialog,
+                "Help",
+                "Select a registration mode to begin:\n\n"
+                "•  2D – 2D: align two radiographs\n"
+                "•  2D – 3D: register live fluoroscopy to a CT volume\n"
+                "•  3D – 3D: register a tracked 3D model to the CT volume",
+            )
+        )
+        row.addWidget(help_btn, 0)
+
+        # Keep the date/time ticking while the landing page is shown.
+        self._landing_footer_timer = qt.QTimer(footer)
+        self._landing_footer_timer.setInterval(1000)
+        self._landing_footer_timer.timeout.connect(self._update_landing_footer_clock)
+        self._landing_footer_timer.start()
+
+        return footer
+
+    def _update_landing_footer_clock(self):
+        try:
+            now = qt.QDateTime.currentDateTime()
+            if getattr(self, "_landing_footer_date", None) is not None:
+                self._landing_footer_date.setText(now.toString("d MMM yyyy"))
+            if getattr(self, "_landing_footer_time", None) is not None:
+                self._landing_footer_time.setText(now.toString("h:mm AP"))
+        except Exception:
+            pass
+
+    def _safe_open_settings(self):
+        """Open the Settings dialog from the landing page. The landing shell is
+        a fullscreen, frameless, always-on-top window, so the dialog must be
+        floated above it (and its flags restored afterwards) or it opens hidden
+        behind the shell."""
+        dlg = getattr(self, "settingsDialog", None)
+        if dlg is None:
+            try:
+                self.raiseSettings()
+            except Exception:
+                logging.exception("Failed to open settings from the landing footer")
+            return
+
+        shell = getattr(self, "_shell_dialog", None)
+        original_flags = dlg.windowFlags()
+        try:
+            dlg.setWindowFlags(original_flags | qt.Qt.WindowStaysOnTopHint)
+            self._refresh_session_summary()
+
+            def _bring_to_front():
+                try:
+                    if shell is not None and shell.isVisible():
+                        geo = dlg.frameGeometry()
+                        geo.moveCenter(shell.geometry().center())
+                        dlg.move(geo.topLeft())
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+
+            # Raise/centre once the modal event loop is running.
+            qt.QTimer.singleShot(0, _bring_to_front)
+            dlg.exec()
+            self._refresh_session_summary()
+        except Exception:
+            logging.exception("Failed to open settings from the landing footer")
+        finally:
+            try:
+                dlg.setWindowFlags(original_flags)
+            except Exception:
+                pass
+
+    def _footer_icon_pixmap(self, filename: str, size: int = 26) -> qt.QPixmap:
+        """Load a footer icon from the module's Images resources, scaled to a
+        square box. Returns a null pixmap if the file is missing."""
+        try:
+            pm = qt.QPixmap(self.resourcePath(os.path.join("Images", filename)))
+            if not pm.isNull():
+                return pm.scaled(
+                    size, size,
+                    qt.Qt.KeepAspectRatio,
+                    qt.Qt.SmoothTransformation,
+                )
+        except Exception:
+            pass
+        return qt.QPixmap()
+
+    def _footer_icon_label(self, filename: str, size: int = 26) -> qt.QLabel:
+        lbl = qt.QLabel()
+        lbl.setObjectName("RegFooterIcon")
+        pm = self._footer_icon_pixmap(filename, size)
+        if not pm.isNull():
+            lbl.setPixmap(pm)
+        return lbl
+
+    def _show_footer_hint(self, button):
+        """Show the hover hint label centred just above the given icon."""
+        lbl = getattr(self, "_landing_footer_hint", None)
+        if lbl is None:
+            return
+        try:
+            text = button.property("footerHint") or ""
+            if not text:
+                lbl.hide()
+                return
+            lbl.setText(text)
+            lbl.adjustSize()
+            parent = lbl.parentWidget()
+            top_left = button.mapTo(parent, qt.QPoint(0, 0))
+            x = top_left.x() + (button.width - lbl.width) // 2
+            y = top_left.y() - lbl.height - 8
+            lbl.move(x, y)
+            lbl.raise_()
+            lbl.show()
+        except Exception:
+            pass
+
+    def _hide_footer_hint(self):
+        lbl = getattr(self, "_landing_footer_hint", None)
+        if lbl is not None:
+            try:
+                lbl.hide()
+            except Exception:
+                pass
+
+    def _get_footer_hover_filter(self):
+        """Event filter that shows each icon's name in a small label above the
+        hovered icon (a reliable substitute for tooltips, which render behind
+        the always-on-top landing page)."""
+        existing = getattr(self, "_footer_hover_filter", None)
+        if existing is not None:
+            return existing
+
+        class _HoverFilter(qt.QObject):
+            def __init__(self, owner):
+                qt.QObject.__init__(self)
+                self._owner = owner
+
+            def eventFilter(self, obj, event):
+                try:
+                    et = event.type()
+                    if et == qt.QEvent.Enter:
+                        self._owner._show_footer_hint(obj)
+                    elif et == qt.QEvent.Leave:
+                        self._owner._hide_footer_hint()
+                except Exception:
+                    pass
+                return False
+
+        flt = _HoverFilter(self)
+        self._footer_hover_filter = flt
+        return flt
+
+    # ----- Mode icons (drawn programmatically, no asset files needed) -----
+
+    def _make_mode_icon_2d_2d(self) -> qt.QPixmap:
+        return self._load_mode_icon("2dimage.png", self._paint_icon_2d_2d)
+
+    def _make_mode_icon_2d_3d(self) -> qt.QPixmap:
+        return self._load_mode_icon("2d-3dimage.png", self._paint_icon_2d_3d)
+
+    def _make_mode_icon_3d_3d(self) -> qt.QPixmap:
+        return self._load_mode_icon("3dimage.png", self._paint_icon_3d_3d)
+
+    def _load_mode_icon(self, image_filename: str, paint_fn) -> qt.QPixmap:
+        """Use the bundled landing-page image for a mode card, scaled to the
+        icon canvas. Tries the on-disk module resource first (so newly added
+        images show up without recompiling Qt resources), then the compiled
+        ":/" resource, and finally falls back to the programmatically painted
+        icon if neither image is available."""
+        candidate_paths = []
+        try:
+            candidate_paths.append(self.resourcePath(os.path.join("Images", image_filename)))
+        except Exception:
+            pass
+        candidate_paths.append(":/" + image_filename)
+        for path in candidate_paths:
+            pixmap = qt.QPixmap(path)
+            if not pixmap.isNull():
+                # Fill the image area of the card (560x560 card, ~28px inner
+                # padding; title sits below the card), keeping aspect ratio.
+                return pixmap.scaled(
+                    500, 500,
+                    qt.Qt.KeepAspectRatio,
+                    qt.Qt.SmoothTransformation,
+                )
+        return self._render_mode_icon(paint_fn)
+
+    def _render_mode_icon(self, paint_fn) -> qt.QPixmap:
+        size = 224
+        pixmap = qt.QPixmap(size, size)
+        pixmap.fill(qt.QColor(0, 0, 0, 0))
+        painter = qt.QPainter(pixmap)
+        try:
+            painter.setRenderHint(qt.QPainter.Antialiasing, True)
+            painter.setRenderHint(qt.QPainter.SmoothPixmapTransform, True)
+            paint_fn(painter, size)
+        except Exception:
+            logging.exception("Failed to paint registration mode icon")
+        finally:
+            painter.end()
+        return pixmap
+
+    def _paint_icon_2d_2d(self, painter: qt.QPainter, size: int):
+        stroke = qt.QColor("#7aa7ff")
+        fill = qt.QColor(79, 134, 255, 40)
+        pen = qt.QPen(stroke, 2.5)
+        painter.setPen(pen)
+        painter.setBrush(qt.QBrush(fill))
+
+        rect_w = size * 0.38
+        rect_h = size * 0.52
+        top = (size - rect_h) / 2
+        left1 = size * 0.05
+        left2 = size - left1 - rect_w
+        painter.drawRoundedRect(qt.QRectF(left1, top, rect_w, rect_h), 6, 6)
+        painter.drawRoundedRect(qt.QRectF(left2, top, rect_w, rect_h), 6, 6)
+
+        # Alignment cross-hairs inside each rectangle
+        painter.setBrush(qt.QBrush())
+        thin = qt.QPen(qt.QColor("#4f86ff"), 1.2, qt.Qt.DashLine)
+        painter.setPen(thin)
+        for cx in (left1 + rect_w / 2, left2 + rect_w / 2):
+            cy = top + rect_h / 2
+            painter.drawLine(qt.QPointF(cx - rect_w * 0.32, cy), qt.QPointF(cx + rect_w * 0.32, cy))
+            painter.drawLine(qt.QPointF(cx, top + rect_h * 0.1), qt.QPointF(cx, top + rect_h * 0.9))
+
+        # Double-headed arrow between rectangles
+        arrow_pen = qt.QPen(qt.QColor("#e4ecff"), 2.2)
+        painter.setPen(arrow_pen)
+        y_mid = size / 2
+        x_start = left1 + rect_w + size * 0.02
+        x_end = left2 - size * 0.02
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_end, y_mid))
+        tip = size * 0.035
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_start + tip, y_mid - tip))
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_start + tip, y_mid + tip))
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid - tip))
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid + tip))
+
+    def _paint_icon_2d_3d(self, painter: qt.QPainter, size: int):
+        stroke = qt.QColor("#7aa7ff")
+        fill = qt.QColor(79, 134, 255, 40)
+
+        # Left: 2D plane (rounded rect)
+        painter.setPen(qt.QPen(stroke, 2.5))
+        painter.setBrush(qt.QBrush(fill))
+        rect_w = size * 0.32
+        rect_h = size * 0.52
+        left = size * 0.06
+        top = (size - rect_h) / 2
+        painter.drawRoundedRect(qt.QRectF(left, top, rect_w, rect_h), 6, 6)
+
+        # Cross-hairs on 2D plane
+        painter.setBrush(qt.QBrush())
+        painter.setPen(qt.QPen(qt.QColor("#4f86ff"), 1.2, qt.Qt.DashLine))
+        cx = left + rect_w / 2
+        cy = top + rect_h / 2
+        painter.drawLine(qt.QPointF(cx - rect_w * 0.32, cy), qt.QPointF(cx + rect_w * 0.32, cy))
+        painter.drawLine(qt.QPointF(cx, top + rect_h * 0.1), qt.QPointF(cx, top + rect_h * 0.9))
+
+        # Right: isometric cube
+        self._draw_iso_cube(
+            painter,
+            center=qt.QPointF(size * 0.72, size / 2),
+            side=size * 0.28,
+        )
+
+        # Arrow between 2D and 3D
+        arrow_pen = qt.QPen(qt.QColor("#e4ecff"), 2.2)
+        painter.setPen(arrow_pen)
+        y_mid = size / 2
+        x_start = left + rect_w + size * 0.02
+        x_end = size * 0.56
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_end, y_mid))
+        tip = size * 0.035
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid - tip))
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid + tip))
+
+    def _paint_icon_3d_3d(self, painter: qt.QPainter, size: int):
+        self._draw_iso_cube(painter, center=qt.QPointF(size * 0.28, size / 2), side=size * 0.24)
+        self._draw_iso_cube(painter, center=qt.QPointF(size * 0.72, size / 2), side=size * 0.24)
+
+        # Double-headed arrow between cubes
+        arrow_pen = qt.QPen(qt.QColor("#e4ecff"), 2.2)
+        painter.setPen(arrow_pen)
+        y_mid = size / 2
+        x_start = size * 0.44
+        x_end = size * 0.56
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_end, y_mid))
+        tip = size * 0.035
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_start + tip, y_mid - tip))
+        painter.drawLine(qt.QPointF(x_start, y_mid), qt.QPointF(x_start + tip, y_mid + tip))
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid - tip))
+        painter.drawLine(qt.QPointF(x_end, y_mid), qt.QPointF(x_end - tip, y_mid + tip))
+
+    def _draw_iso_cube(self, painter: qt.QPainter, center: qt.QPointF, side: float):
+        stroke = qt.QPen(qt.QColor("#7aa7ff"), 2.2)
+        top_fill = qt.QColor(120, 160, 255, 90)
+        right_fill = qt.QColor(79, 134, 255, 70)
+        left_fill = qt.QColor(50, 90, 200, 70)
+
+        dx = side
+        dy = side * 0.5
+        depth = side
+
+        # Anchor points (front-bottom corner of the cube)
+        fbx = center.x()
+        fby = center.y() + dy + depth * 0.25
+        # Define cube vertices
+        front_bottom = qt.QPointF(fbx, fby)
+        front_top = qt.QPointF(fbx, fby - depth)
+        left_bottom = qt.QPointF(fbx - dx, fby - dy)
+        left_top = qt.QPointF(fbx - dx, fby - dy - depth)
+        right_bottom = qt.QPointF(fbx + dx, fby - dy)
+        right_top = qt.QPointF(fbx + dx, fby - dy - depth)
+        back_top = qt.QPointF(fbx, fby - dy - depth - dy)
+
+        # Top face (diamond)
+        top_poly = qt.QPolygonF()
+        top_poly.append(front_top)
+        top_poly.append(right_top)
+        top_poly.append(back_top)
+        top_poly.append(left_top)
+        painter.setPen(stroke)
+        painter.setBrush(qt.QBrush(top_fill))
+        painter.drawPolygon(top_poly)
+
+        # Right face
+        right_poly = qt.QPolygonF()
+        right_poly.append(front_top)
+        right_poly.append(right_top)
+        right_poly.append(right_bottom)
+        right_poly.append(front_bottom)
+        painter.setBrush(qt.QBrush(right_fill))
+        painter.drawPolygon(right_poly)
+
+        # Left face
+        left_poly = qt.QPolygonF()
+        left_poly.append(front_top)
+        left_poly.append(left_top)
+        left_poly.append(left_bottom)
+        left_poly.append(front_bottom)
+        painter.setBrush(qt.QBrush(left_fill))
+        painter.drawPolygon(left_poly)
+
+    def _setup_runtime_monitoring(self):
+        if self._runtime_refresh_timer is None:
+            self._runtime_refresh_timer = qt.QTimer()
+            self._runtime_refresh_timer.setInterval(700)
+            self._runtime_refresh_timer.timeout.connect(self._refresh_runtime_from_scene)
+
+        self.removeObservers()
+        if slicer.mrmlScene is not None:
+            for event_id in (
+                slicer.mrmlScene.NodeAddedEvent,
+                slicer.mrmlScene.NodeRemovedEvent,
+                slicer.mrmlScene.EndImportEvent,
+                slicer.mrmlScene.EndCloseEvent,
+            ):
+                self.addObserver(slicer.mrmlScene, event_id, self._on_scene_runtime_changed)
+
+        self._start_runtime_monitoring()
+
+    def _start_runtime_monitoring(self):
+        if self._runtime_refresh_timer is not None and not self._runtime_refresh_timer.isActive():
+            self._runtime_refresh_timer.start()
+
+    def _stop_runtime_monitoring(self):
+        if self._runtime_refresh_timer is not None:
+            self._runtime_refresh_timer.stop()
+            self._runtime_refresh_timer.deleteLater()
+            self._runtime_refresh_timer = None
+        self._detach_rate_monitor()
+
+    def _on_scene_runtime_changed(self, *_args):
+        if self._runtime_refresh_pending:
+            return
+        self._runtime_refresh_pending = True
+        qt.QTimer.singleShot(0, self._flush_pending_runtime_refresh)
+
+    def _flush_pending_runtime_refresh(self):
+        self._runtime_refresh_pending = False
+        self._refresh_runtime_from_scene()
+
+    # -----------------
+    # Workflow UI
+    # -----------------
+
+    def _build_workflow_ui(self):
+        # Root layout from Home.ui (a simple empty container)
+        root_layout = self.uiWidget.layout()
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        scroll = qt.QScrollArea()
+        scroll.setFrameShape(qt.QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        root_layout.addWidget(scroll)
+        self._scroll_area = scroll
+
+        root = qt.QWidget()
+        root.objectName = "SpineTrackerWorkflowRoot"
+        scroll.setWidget(root)
+
+        layout = qt.QVBoxLayout(root)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(18)
+
+        try:
+            tracking_mode_strip = self._create_tracking_mode_strip()
+            capture_card = self._create_capture_inputs_card()
+            guidance_card = self._create_guidance_controls_card()
+        except Exception as exc:
+            logging.exception("Failed to build Home workflow panel")
+            error = qt.QLabel(f"Home panel failed to load:\n{exc}")
+            error.setProperty("errorText", True)
+            error.wordWrap = True
+            layout.addWidget(error)
+            return
+
+        # Sidebar hide button — a compact chevron at the top of the sidebar
+        # that collapses the whole module panel. A floating reveal button
+        # on the main window brings it back.
+        hide_row = qt.QHBoxLayout()
+        hide_row.setContentsMargins(0, 0, 0, 0)
+        hide_row.setSpacing(8)
+
+        self._back_to_mode_button = qt.QPushButton("◀  Back")
+        self._back_to_mode_button.setToolTip("Return to the registration mode selection page.")
+        self._back_to_mode_button.setProperty("sidebarHideButton", True)
+        self._back_to_mode_button.setStyleSheet(
+            "QPushButton[sidebarHideButton=\"true\"] {"
+            "  background: transparent;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #2a3a55;"
+            "  border-radius: 6px;"
+            "  padding: 4px 10px;"
+            "  font-weight: 600;"
+            "}"
+            "QPushButton[sidebarHideButton=\"true\"]:hover {"
+            "  background: #1b2a44;"
+            "  color: #ffffff;"
+            "  border-color: #3a7dde;"
+            "}"
+        )
+        self._back_to_mode_button.clicked.connect(self._on_back_to_mode_clicked)
+        hide_row.addWidget(self._back_to_mode_button)
+
+        hide_row.addStretch(1)
+        self._sidebar_hide_button = qt.QPushButton("◀  Hide Sidebar")
+        self._sidebar_hide_button.setToolTip("Hide this sidebar to free up space for the 3D views")
+        self._sidebar_hide_button.setProperty("sidebarHideButton", True)
+        self._sidebar_hide_button.setStyleSheet(
+            "QPushButton[sidebarHideButton=\"true\"] {"
+            "  background: transparent;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #2a3a55;"
+            "  border-radius: 6px;"
+            "  padding: 4px 10px;"
+            "  font-weight: 600;"
+            "}"
+            "QPushButton[sidebarHideButton=\"true\"]:hover {"
+            "  background: #1b2a44;"
+            "  color: #ffffff;"
+            "  border-color: #3a7dde;"
+            "}"
+        )
+        self._sidebar_hide_button.clicked.connect(lambda _checked=False: self._set_sidebar_visible(False))
+        hide_row.addWidget(self._sidebar_hide_button)
+        layout.addLayout(hide_row)
+
+        # --- Sidebar tabs (Tracking / Accuracy) -------------------------------
+        # The sidebar splits its content across two tabs backed by a single
+        # QStackedWidget so switching is purely a UI-visibility change: all
+        # widgets stay parented and alive, so tracking, PlusServer state, and
+        # any in-flight data are not reset when the user toggles tabs.
+        self._sidebar_tab_bar = qt.QWidget()
+        tab_bar_layout = qt.QHBoxLayout(self._sidebar_tab_bar)
+        tab_bar_layout.setContentsMargins(0, 0, 0, 0)
+        tab_bar_layout.setSpacing(6)
+
+        self._sidebar_tracking_tab_button = qt.QPushButton("Tracking")
+        self._sidebar_tracking_tab_button.setCheckable(True)
+        self._sidebar_tracking_tab_button.setChecked(True)
+        self._sidebar_tracking_tab_button.setProperty("sidebarTabButton", True)
+        self._sidebar_tracking_tab_button.clicked.connect(
+            lambda _checked=False: self._set_sidebar_tab(0)
+        )
+        tab_bar_layout.addWidget(self._sidebar_tracking_tab_button, 1)
+
+        self._sidebar_accuracy_tab_button = qt.QPushButton("Accuracy")
+        self._sidebar_accuracy_tab_button.setCheckable(True)
+        self._sidebar_accuracy_tab_button.setChecked(False)
+        self._sidebar_accuracy_tab_button.setProperty("sidebarTabButton", True)
+        self._sidebar_accuracy_tab_button.clicked.connect(
+            lambda _checked=False: self._set_sidebar_tab(1)
+        )
+        tab_bar_layout.addWidget(self._sidebar_accuracy_tab_button, 1)
+
+        tab_button_style = (
+            "QPushButton[sidebarTabButton=\"true\"] {"
+            "  background: transparent;"
+            "  color: #9fb4d8;"
+            "  border: 1px solid #2a3a55;"
+            "  border-radius: 6px;"
+            "  padding: 6px 12px;"
+            "  font-weight: 600;"
+            "}"
+            "QPushButton[sidebarTabButton=\"true\"]:hover {"
+            "  background: #1b2a44;"
+            "  color: #ffffff;"
+            "  border-color: #3a7dde;"
+            "}"
+            "QPushButton[sidebarTabButton=\"true\"]:checked {"
+            "  background: #1b2a44;"
+            "  color: #ffffff;"
+            "  border-color: #3a7dde;"
+            "}"
+        )
+        self._sidebar_tracking_tab_button.setStyleSheet(tab_button_style)
+        self._sidebar_accuracy_tab_button.setStyleSheet(tab_button_style)
+        layout.addWidget(self._sidebar_tab_bar)
+
+        self._sidebar_stack = qt.QStackedWidget()
+        layout.addWidget(self._sidebar_stack, 1)
+
+        # Tracking tab -----------------------------------------------------
+        tracking_page = qt.QWidget()
+        tracking_layout = qt.QVBoxLayout(tracking_page)
+        tracking_layout.setContentsMargins(0, 0, 0, 0)
+        tracking_layout.setSpacing(18)
+
+        # Keep only tracking-mode controls pinned to the top.
+        tracking_layout.addWidget(tracking_mode_strip)
+        # Keep load controls around middle while guidance stays lower.
+        tracking_layout.addStretch(1)
+        tracking_layout.addWidget(capture_card)
+        tracking_layout.addStretch(1)
+
+        # Keep PLUS connectivity fields alive for the workflow, but keep the card out of sight.
+        connect_plus_card = self._create_connect_plus_card()
+        connect_plus_card.setVisible(False)
+        tracking_layout.addWidget(connect_plus_card)
+
+        tracking_layout.addWidget(guidance_card)
+
+        # Keep runtime status widgets alive for internal state sync, but hide the card in the Home layout.
+        status_card, _status_layout = self._create_status_card()
+        status_card.setVisible(False)
+        tracking_layout.addWidget(status_card)
+
+        self._sidebar_stack.addWidget(tracking_page)
+
+        # Accuracy tab -----------------------------------------------------
+        accuracy_page = qt.QWidget()
+        accuracy_layout = qt.QVBoxLayout(accuracy_page)
+        accuracy_layout.setContentsMargins(0, 0, 0, 0)
+        accuracy_layout.setSpacing(18)
+        accuracy_layout.addWidget(self._create_accuracy_assessment_section())
+        accuracy_layout.addStretch(1)
+        self._sidebar_stack.addWidget(accuracy_page)
+
+        # Default to the Tracking tab.
+        self._sidebar_stack.setCurrentIndex(0)
+
+        qt.QTimer.singleShot(0, self._scroll_home_to_top)
+
+        # Initial status
+        for key, text in (
+            ("launcher", "Launcher: idle"),
+            ("server", "Server: idle"),
+            ("ct", "CT: not loaded"),
+            ("registration", "Registration: not applied"),
+            ("vr", "Volume rendering: off"),
+            ("needle", "Needle: not loaded"),
+            ("transforms", "Transforms: not found"),
+            ("tracking", "Tracking: idle"),
+        ):
+            self._set_status(key, _StatusState.WAIT, text)
+        self._refresh_session_summary()
+
+    def _create_legacy_hero_panel(self):
+        card = qt.QFrame()
+        card.objectName = "LegacyHeroCard"
+
+        card_layout = qt.QHBoxLayout(card)
+        card_layout.setContentsMargins(22, 22, 22, 22)
+        card_layout.setSpacing(18)
+
+        left_panel = qt.QFrame()
+        left_panel.objectName = "LegacyHeroPanel"
+        left_layout = qt.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(24, 20, 24, 20)
+        left_layout.setSpacing(14)
+
+        eyebrow = qt.QLabel("HTIC IMAGE-GUIDED WORKFLOW")
+        eyebrow.setProperty("legacyEyebrow", True)
+        left_layout.addWidget(eyebrow)
+
+        title = qt.QLabel("TrackVision")
+        title.objectName = "LegacyHeroTitle"
+        left_layout.addWidget(title)
+
+        subtitle = qt.QLabel(
+            "A focused control room for CT import, PLUS streaming, registration, and live needle guidance."
+        )
+        subtitle.objectName = "LegacyHeroSubtitle"
+        subtitle.wordWrap = True
+        left_layout.addWidget(subtitle)
+
+        chip_row = qt.QHBoxLayout()
+        chip_row.setContentsMargins(0, 0, 0, 0)
+        chip_row.setSpacing(10)
+        for text in ("CT Intake", "PLUS Sync", "Needle Tracking"):
+            chip_row.addWidget(self._create_legacy_chip(text), 0)
+        chip_row.addStretch(1)
+        left_layout.addLayout(chip_row)
+
+        right_panel = qt.QVBoxLayout()
+        right_panel.setContentsMargins(0, 0, 0, 0)
+        right_panel.setSpacing(12)
+
+        self._home_settings_button = qt.QPushButton("Workspace")
+        self._home_settings_button.objectName = "LegacyWorkspaceButton"
+        self._home_settings_button.setIcon(self._tinted_icon("Icons/Gears.png", "#ffffff"))
+        self._home_settings_button.setToolTip("Open workspace settings.")
+        self._home_settings_button.clicked.connect(self.raiseSettings)
+        right_panel.addWidget(self._home_settings_button)
+
+        logo_card = qt.QFrame()
+        logo_card.objectName = "LegacyLogoCard"
+        logo_layout = qt.QVBoxLayout(logo_card)
+        logo_layout.setContentsMargins(16, 16, 16, 16)
+        logo_layout.setSpacing(10)
+
+        logo = qt.QLabel()
+        logo.setAlignment(qt.Qt.AlignCenter)
+        logo.setMinimumHeight(110)
+        logo.setProperty("legacyLogo", True)
+        logo_pixmap = qt.QPixmap(":/Logo.png")
+        if not logo_pixmap.isNull():
+            logo.setPixmap(logo_pixmap.scaled(112, 112, qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation))
+        logo_layout.addWidget(logo)
+
+        org = qt.QLabel("Healthcare Technology\nInnovation Centre")
+        org.setObjectName("LegacyLogoText")
+        org.setAlignment(qt.Qt.AlignCenter)
+        logo_layout.addWidget(org)
+        right_panel.addWidget(logo_card)
+        right_panel.addStretch(1)
+
+        card_layout.addWidget(left_panel, 3)
+        card_layout.addLayout(right_panel, 1)
+        return card
+
+    def _create_legacy_chip(self, text: str):
+        chip = qt.QLabel(text)
+        chip.setProperty("legacyChip", True)
+        chip.setAlignment(qt.Qt.AlignCenter)
+        return chip
+
+    def _create_legacy_card(self, title_text: str, description_text: str, show_header: bool = True):
+        card = qt.QFrame()
+        card.objectName = "LegacyCard"
+        card_layout = qt.QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 18, 18, 18)
+        card_layout.setSpacing(12)
+
+        if show_header:
+            title = qt.QLabel(title_text)
+            title.setProperty("legacyCardTitle", True)
+            card_layout.addWidget(title)
+
+            description = qt.QLabel(description_text)
+            description.setProperty("legacyCardDescription", True)
+            description.wordWrap = True
+            card_layout.addWidget(description)
+
+        body = qt.QVBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
+        card_layout.addLayout(body)
+        return card, body
+
+    def _create_legacy_form_row(self, label_text: str, field_widget, *action_buttons: qt.QPushButton):
+        row = qt.QWidget()
+        row.setProperty("legacyRow", True)
+        row_layout = qt.QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(12)
+
+        label = qt.QLabel(label_text)
+        label.setProperty("legacyFieldLabel", True)
+        label.setFixedWidth(96)
+        label.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
+        row_layout.addWidget(label, 0)
+
+        if field_widget is not None:
+            row_layout.addWidget(field_widget, 1)
+        else:
+            row_layout.addStretch(1)
+        for button in action_buttons:
+            row_layout.addWidget(button, 0)
+        return row
+
+    def _create_tracking_mode_strip(self):
+        tracking_mode_switch = qt.QFrame()
+        tracking_mode_switch.objectName = "TrackingModeSwitch"
+        tracking_mode_layout = qt.QHBoxLayout(tracking_mode_switch)
+        tracking_mode_layout.setContentsMargins(0, 0, 0, 0)
+        tracking_mode_layout.setSpacing(10)
+
+        self._tool_centric_button = qt.QPushButton("Tool Centric")
+        self._tool_centric_button.objectName = "TrackingModeButton"
+        self._tool_centric_button.setCheckable(True)
+        self._tool_centric_button.setAutoExclusive(True)
+        self._tool_centric_button.setToolTip(
+            "Tool-aligned slice views: Red=InPlane, Yellow=InPlane90, Green=Transverse."
+        )
+        self._tool_centric_button.clicked.connect(lambda _checked=False: self._set_tracking_view_mode("tool_centric"))
+        tracking_mode_layout.addWidget(self._tool_centric_button, 1)
+
+        self._scan_centric_button = qt.QPushButton("Scan Centric")
+        self._scan_centric_button.objectName = "TrackingModeButton"
+        self._scan_centric_button.setCheckable(True)
+        self._scan_centric_button.setAutoExclusive(True)
+        self._scan_centric_button.setToolTip(
+            "Scan-aligned slice views: Red=Axial, Yellow=Sagittal, Green=Coronal."
+        )
+        self._scan_centric_button.clicked.connect(lambda _checked=False: self._set_tracking_view_mode("scan_centric"))
+        tracking_mode_layout.addWidget(self._scan_centric_button, 1)
+
+        self._tool_dynamic_button = qt.QPushButton("Tool Dynamic")
+        self._tool_dynamic_button.objectName = "TrackingModeButton"
+        self._tool_dynamic_button.setCheckable(True)
+        self._tool_dynamic_button.setAutoExclusive(True)
+        self._tool_dynamic_button.setToolTip(
+            "Tool-aligned slices plus a tracked-tool 3D camera using SlicerIGT Viewpoint 6DOF bullseye mode."
+        )
+        self._tool_dynamic_button.clicked.connect(lambda _checked=False: self._set_tracking_view_mode("tool_dynamic"))
+        tracking_mode_layout.addWidget(self._tool_dynamic_button, 1)
+        return tracking_mode_switch
+
+    def _create_capture_inputs_card(self):
+        card, body = self._create_legacy_card(
+            "Capture Inputs",
+            "Bring in the study, tool geometry, and registration before the guided workflow starts.",
+            show_header=False,
+        )
+        card.objectName = "LegacyCardFlat"
+        if card.layout() is not None:
+            card.layout().setContentsMargins(0, 0, 0, 0)
+            card.layout().setSpacing(10)
+
+        self._dicom_folder_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Dirs,
+            "Select a folder containing DICOM files (CT).",
+        )
+        self._dicom_folder_path.setToolTip("Select a folder containing DICOM files (CT).")
+
+        self._load_ct_button = qt.QPushButton("Load CT")
+        self._load_ct_button.objectName = "LegacyActionButton"
+        self._load_ct_button.clicked.connect(self._on_pick_and_load_ct_clicked)
+        self._load_ct_button.setToolTip("Select DICOM folder and load CT.")
+        self._load_ct_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        body.addWidget(self._load_ct_button)
+
+        self._needle_stl_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select needle STL to display and track.",
+        )
+        self._needle_stl_path.setToolTip("Select needle STL to display and track.")
+
+        self._load_needle_button = qt.QPushButton("Load STL")
+        self._load_needle_button.objectName = "LegacyActionButton"
+        self._load_needle_button.clicked.connect(self._on_pick_and_load_needle_clicked)
+        self._load_needle_button.setToolTip("Select STL model and load it.")
+        self._load_needle_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        body.addWidget(self._load_needle_button)
+
+        self._registration_matrix_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select registration matrix text file (4x4). Assumed Reference->CT.",
+        )
+        self._registration_matrix_path.setToolTip("Select registration matrix text file (4x4). Assumed Reference->CT.")
+
+        self._load_registration_button = qt.QPushButton("Load Matrix")
+        self._load_registration_button.objectName = "LegacyActionButton"
+        self._load_registration_button.clicked.connect(self._on_pick_and_load_registration_clicked)
+        self._load_registration_button.setToolTip("Select registration matrix and apply it.")
+        self._load_registration_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+
+        self._paste_registration_button = qt.QPushButton("Paste")
+        self._paste_registration_button.objectName = "LegacyActionButton"
+        self._paste_registration_button.clicked.connect(self._on_paste_registration_clicked)
+        self._paste_registration_button.setToolTip("Paste a 4x4 registration matrix directly.")
+        self._paste_registration_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+
+        registration_actions = qt.QWidget()
+        registration_actions_layout = qt.QHBoxLayout(registration_actions)
+        registration_actions_layout.setContentsMargins(0, 0, 0, 0)
+        registration_actions_layout.setSpacing(12)
+        registration_actions_layout.addWidget(self._load_registration_button, 1)
+        registration_actions_layout.addWidget(self._paste_registration_button, 1)
+        body.addWidget(registration_actions)
+
+        # --- Internal PlusServer: geometry buttons & status ---
+        self._load_phantom_geometry_button = qt.QPushButton("Load Phantom")
+        self._load_phantom_geometry_button.objectName = "LegacyActionButton"
+        self._load_phantom_geometry_button.clicked.connect(self._on_pick_phantom_geometry_clicked)
+        self._load_phantom_geometry_button.setToolTip("Select the phantom geometry .ini file for the Atracsys tracker.")
+        self._load_phantom_geometry_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+
+        self._load_tool_geometry_button = qt.QPushButton("Load Tool")
+        self._load_tool_geometry_button.objectName = "LegacyActionButton"
+        self._load_tool_geometry_button.clicked.connect(self._on_pick_tool_geometry_clicked)
+        self._load_tool_geometry_button.setToolTip("Select the tool/pointer geometry .ini file for the Atracsys tracker.")
+        self._load_tool_geometry_button.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+
+        geometry_actions = qt.QWidget()
+        geometry_actions_layout = qt.QHBoxLayout(geometry_actions)
+        geometry_actions_layout.setContentsMargins(0, 0, 0, 0)
+        geometry_actions_layout.setSpacing(12)
+        geometry_actions_layout.addWidget(self._load_phantom_geometry_button, 1)
+        geometry_actions_layout.addWidget(self._load_tool_geometry_button, 1)
+        body.addWidget(geometry_actions)
+
+        # Per-file status labels below buttons
+        self._phantom_status_label = qt.QLabel("")
+        self._phantom_status_label.setStyleSheet("color: #aaaaaa; font-size: 11px; padding: 2px 8px;")
+        body.addWidget(self._phantom_status_label)
+
+        self._tool_status_label = qt.QLabel("")
+        self._tool_status_label.setStyleSheet("color: #aaaaaa; font-size: 11px; padding: 2px 8px;")
+        body.addWidget(self._tool_status_label)
+
+        # PlusServer status label — shows connection / tracking state
+        self._plus_status_label = qt.QLabel("PlusServer: Not started")
+        self._plus_status_label.setStyleSheet(
+            "color: #aaaaaa; font-size: 11px; padding: 4px 8px; "
+            "border: 1px solid #444444; border-radius: 4px; background: #1a1a2e;"
+        )
+        self._plus_status_label.setWordWrap(True)
+        body.addWidget(self._plus_status_label)
+
+        # Hidden path fields for storing geometry & exe paths (used by settings persistence)
+        self._phantom_geometry_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select phantom geometry file (.ini).",
+        )
+        self._phantom_geometry_path.nameFilters = ["Geometry files (*.ini)", "All files (*)"]
+        self._phantom_geometry_path.setVisible(False)
+
+        self._tool_geometry_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select tool/pointer geometry file (.ini).",
+        )
+        self._tool_geometry_path.nameFilters = ["Geometry files (*.ini)", "All files (*)"]
+        self._tool_geometry_path.setVisible(False)
+
+        self._plus_exe_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select PlusServer.exe path.",
+        )
+        self._plus_exe_path.nameFilters = ["PlusServer (PlusServer.exe)", "All files (*)"]
+        self._plus_exe_path.setVisible(False)
+
+        self._phantom_geometry_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._tool_geometry_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._plus_exe_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        # --- End Internal PlusServer pickers ---
+
+        quick_utilities = qt.QWidget()
+        quick_utilities_layout = qt.QGridLayout(quick_utilities)
+        quick_utilities_layout.setContentsMargins(0, 0, 0, 0)
+        quick_utilities_layout.setHorizontalSpacing(10)
+        quick_utilities_layout.setVerticalSpacing(10)
+
+        self._initialize_tracking_button = qt.QPushButton("Init Tracking")
+        self._initialize_tracking_button.objectName = "LegacyActionButton"
+        self._initialize_tracking_button.setToolTip(
+            "Launch the PLUS tracker server. Once it reports ready, click Start Tracking to connect the OpenIGTLink stream."
+        )
+        self._initialize_tracking_button.clicked.connect(self._on_initialize_tracking_clicked)
+        quick_utilities_layout.addWidget(self._initialize_tracking_button, 0, 0)
+
+        self._start_tracking_button = qt.QPushButton("Start Tracking")
+        self._start_tracking_button.objectName = "LegacyActionButton"
+        self._start_tracking_button.setToolTip(
+            "Connect to the OpenIGTLink tracker stream and begin tracking. Run Init Tracking first."
+        )
+        self._start_tracking_button.setEnabled(False)
+        self._start_tracking_button.clicked.connect(self._on_start_tracking_clicked)
+        quick_utilities_layout.addWidget(self._start_tracking_button, 0, 1)
+
+        self._open_reslicer_button = qt.QPushButton("Volume Reslicer")
+        self._open_reslicer_button.objectName = "LegacySecondaryButton"
+        self._open_reslicer_button.clicked.connect(self._on_open_reslicer_clicked)
+        quick_utilities_layout.addWidget(self._open_reslicer_button, 1, 0, 1, 2)
+        body.addWidget(quick_utilities)
+
+        window_level_section = qt.QWidget()
+        window_level_layout = qt.QVBoxLayout(window_level_section)
+        window_level_layout.setContentsMargins(0, 0, 0, 0)
+        window_level_layout.setSpacing(8)
+
+        window_row = qt.QWidget()
+        window_row_layout = qt.QHBoxLayout(window_row)
+        window_row_layout.setContentsMargins(0, 0, 0, 0)
+        window_row_layout.setSpacing(10)
+        window_label = qt.QLabel("Window")
+        window_label.setProperty("windowLevelLabel", True)
+        window_label.setFixedWidth(84)
+        window_row_layout.addWidget(window_label, 0)
+        self._window_slider = qt.QSlider(qt.Qt.Horizontal)
+        self._window_slider.setMinimum(1)
+        self._window_slider.setMaximum(4000)
+        self._window_slider.setValue(_DEFAULT_WINDOW_VALUE)
+        self._window_slider.setEnabled(False)
+        self._window_slider.valueChanged.connect(self._on_window_slider_changed)
+        window_row_layout.addWidget(self._window_slider, 1)
+        self._window_value_label = qt.QLabel("--")
+        self._window_value_label.setFixedWidth(64)
+        self._window_value_label.setAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        window_row_layout.addWidget(self._window_value_label, 0)
+        window_level_layout.addWidget(window_row)
+
+        level_row = qt.QWidget()
+        level_row_layout = qt.QHBoxLayout(level_row)
+        level_row_layout.setContentsMargins(0, 0, 0, 0)
+        level_row_layout.setSpacing(10)
+        level_label = qt.QLabel("Level")
+        level_label.setProperty("windowLevelLabel", True)
+        level_label.setFixedWidth(84)
+        level_row_layout.addWidget(level_label, 0)
+        self._level_slider = qt.QSlider(qt.Qt.Horizontal)
+        self._level_slider.setMinimum(-1500)
+        self._level_slider.setMaximum(3000)
+        self._level_slider.setValue(_DEFAULT_LEVEL_VALUE)
+        self._level_slider.setEnabled(False)
+        self._level_slider.valueChanged.connect(self._on_level_slider_changed)
+        level_row_layout.addWidget(self._level_slider, 1)
+        self._level_value_label = qt.QLabel("--")
+        self._level_value_label.setFixedWidth(64)
+        self._level_value_label.setAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        level_row_layout.addWidget(self._level_value_label, 0)
+        window_level_layout.addWidget(level_row)
+
+        shift_row = qt.QWidget()
+        shift_row_layout = qt.QHBoxLayout(shift_row)
+        shift_row_layout.setContentsMargins(0, 0, 0, 0)
+        shift_row_layout.setSpacing(10)
+        shift_label = qt.QLabel("Shift")
+        shift_label.setProperty("windowLevelLabel", True)
+        shift_label.setFixedWidth(84)
+        shift_row_layout.addWidget(shift_label, 0)
+        self._shift_slider = qt.QSlider(qt.Qt.Horizontal)
+        self._shift_slider.setMinimum(-_DEFAULT_VR_SHIFT_RANGE_HU)
+        self._shift_slider.setMaximum(_DEFAULT_VR_SHIFT_RANGE_HU)
+        self._shift_slider.setValue(0)
+        self._shift_slider.setEnabled(False)
+        self._shift_slider.setToolTip("Shift 3D volume rendering (moves the intensity transfer function).")
+        self._shift_slider.valueChanged.connect(self._on_shift_slider_changed)
+        shift_row_layout.addWidget(self._shift_slider, 1)
+        self._shift_value_label = qt.QLabel("--")
+        self._shift_value_label.setFixedWidth(64)
+        self._shift_value_label.setAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        shift_row_layout.addWidget(self._shift_value_label, 0)
+        window_level_layout.addWidget(shift_row)
+
+        body.addWidget(window_level_section)
+
+        self._dicom_folder_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._needle_stl_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._registration_matrix_path.currentPathChanged.connect(self._on_settings_fields_changed)
+
+        return card
+
+    def _create_connect_plus_card(self):
+        card, body = self._create_legacy_card(
+            "Connect PLUS",
+            "Point TrackVision at the launcher and the streaming endpoint used for live guidance.",
+        )
+
+        self._launcher_host = qt.QLineEdit()
+        self._launcher_host.setPlaceholderText("localhost")
+        body.addWidget(self._create_legacy_form_row("Launcher Host", self._launcher_host))
+
+        self._launcher_port = qt.QSpinBox()
+        self._launcher_port.minimum = 1
+        self._launcher_port.maximum = 65535
+        body.addWidget(self._create_legacy_form_row("Launcher Port", self._launcher_port))
+
+        self._plus_config_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select PLUS config XML (.plus.xml).",
+        )
+        body.addWidget(self._create_legacy_form_row("Config XML", self._plus_config_path))
+
+        self._igtl_host = qt.QLineEdit()
+        self._igtl_host.setPlaceholderText("localhost")
+        body.addWidget(self._create_legacy_form_row("IGTL Host", self._igtl_host))
+
+        self._igtl_port = qt.QSpinBox()
+        self._igtl_port.minimum = 1
+        self._igtl_port.maximum = 65535
+        body.addWidget(self._create_legacy_form_row("IGTL Port", self._igtl_port))
+
+        self._plus_config_path.currentPathChanged.connect(self._on_plus_config_path_changed)
+        self._plus_config_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._launcher_host.textChanged.connect(self._on_settings_fields_changed)
+        self._launcher_port.valueChanged.connect(self._on_settings_fields_changed)
+        self._igtl_host.textChanged.connect(self._on_settings_fields_changed)
+        self._igtl_port.valueChanged.connect(self._on_settings_fields_changed)
+
+        return card
+
+    def _create_guidance_controls_card(self):
+        card, body = self._create_legacy_card(
+            "Guidance Controls",
+            "Set transform defaults, initialize tracking, and open the workflow tools used during navigation.",
+            show_header=False,
+        )
+        card.objectName = "LegacyCardFlat"
+        if card.layout() is not None:
+            card.layout().setContentsMargins(0, 0, 0, 0)
+            card.layout().setSpacing(10)
+
+        # Place the Tracking Accuracy card (registration accuracy, tool jitter,
+        # and the live update-rate / latency readout) into the visible sidebar.
+        body.addWidget(self._create_tracking_accuracy_card())
+
+        # Accuracy Assessment section is hosted in its own sidebar tab; see
+        # _build_workflow_ui where it is placed into the Accuracy QStackedWidget page.
+
+        self._additional_settings_button = qt.QPushButton("Additional Settings")
+        self._additional_settings_button.objectName = "LegacySecondaryButton"
+        self._additional_settings_button.setProperty("additionalSettingsButton", True)
+        self._additional_settings_button.setToolTip("Open transform and utility controls.")
+        self._additional_settings_button.setIcon(self._tinted_icon("Icons/Gears.png", "#ffffff"))
+        self._additional_settings_button.setIconSize(qt.QSize(16, 16))
+        self._additional_settings_button.clicked.connect(self._on_open_additional_settings_clicked)
+        body.addWidget(self._additional_settings_button)
+
+        self._start_button = qt.QPushButton("Start Navigate")
+        self._start_button.objectName = "PrimaryButton"
+        self._start_button.clicked.connect(self._on_start_clicked)
+        self._start_button.setVisible(False)
+
+        self._stop_button = qt.QPushButton("Stop Workflow")
+        self._stop_button.objectName = "LegacySecondaryButton"
+        self._stop_button.clicked.connect(self._on_stop_clicked)
+        self._stop_button.setVisible(False)
+
+        self._build_additional_settings_dialog()
+        return card
+
+    def _create_tracking_accuracy_card(self):
+        card = qt.QFrame()
+        card.setProperty("trackingAccuracyCard", True)
+        self._tracking_accuracy_card = card
+
+        card_layout = qt.QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setSpacing(6)
+
+        title = qt.QLabel("Tracking Performance")
+        title.setProperty("trackingAccuracyTitle", True)
+        card_layout.addWidget(title)
+
+        # Registration-accuracy and tool-jitter rows intentionally omitted; this
+        # card shows only the live FPS / latency metrics.
+        self._registration_rmse_label = None
+        self._tool_jitter_rmse_label = None
+
+        self._tracking_rate_label = qt.QLabel("Update rate: --")
+        self._tracking_rate_label.setProperty("trackingAccuracyValue", True)
+        self._tracking_rate_label.setToolTip(
+            "Live transform update rate (FPS) and inter-frame interval (mean +/- jitter) measured from the "
+            "incoming tracker stream. 'latency' is the stream age from the tracker's own acquisition timestamp "
+            "(transport + queue), shown only when the stream provides one; for true end-to-end latency use the "
+            "high-speed-video method."
+        )
+        card_layout.addWidget(self._tracking_rate_label)
+        return card
+
+    # -------------------------------------------------------------------
+    # Accuracy Assessment panel
+    # -------------------------------------------------------------------
+
+    _ACCURACY_DARK_STYLE = (
+        "QGroupBox {"
+        "  background: #000000;"
+        "  color: #ffffff;"
+        "  border: 1px solid #24385c;"
+        "  border-radius: 8px;"
+        "  margin-top: 14px;"
+        "  padding: 10px;"
+        "  font-weight: 700;"
+        "}"
+        "QGroupBox::title {"
+        "  subcontrol-origin: margin;"
+        "  left: 10px;"
+        "  padding: 0 6px;"
+        "  color: #9fb4d8;"
+        "  letter-spacing: 1px;"
+        "}"
+        "QPushButton {"
+        "  background: #000000;"
+        "  color: #ffffff;"
+        "  border: 1px solid #24385c;"
+        "  border-radius: 6px;"
+        "  padding: 6px 10px;"
+        "  font-weight: 600;"
+        "}"
+        "QPushButton:hover { border-color: #4f86ff; }"
+        "QPushButton:disabled { color: #4a5c7a; border-color: #1b2a44; }"
+        "QListWidget, QTableWidget {"
+        "  background: #000000;"
+        "  color: #ffffff;"
+        "  border: 1px solid #24385c;"
+        "  border-radius: 6px;"
+        "  selection-background-color: #1b2a44;"
+        "  selection-color: #ffffff;"
+        "}"
+        "QHeaderView::section {"
+        "  background: #0a1428;"
+        "  color: #9fb4d8;"
+        "  border: 0px;"
+        "  border-bottom: 1px solid #24385c;"
+        "  padding: 4px;"
+        "  font-weight: 700;"
+        "}"
+        "QLabel { color: #ffffff; }"
+    )
+
+    def _create_accuracy_assessment_section(self) -> qt.QGroupBox:
+        """Build the Accuracy Assessment collapsible section.
+
+        Lets the user record physical target positions with the tracker, then
+        measure pointer-to-target error per target, and export to CSV.
+        """
+        group = qt.QGroupBox("Accuracy Assessment")
+        group.setStyleSheet(self._ACCURACY_DARK_STYLE)
+        layout = qt.QVBoxLayout(group)
+        layout.setContentsMargins(10, 14, 10, 10)
+        layout.setSpacing(8)
+
+        # --- Target acquisition row ---
+        target_row = qt.QHBoxLayout()
+        target_row.setContentsMargins(0, 0, 0, 0)
+        target_row.setSpacing(6)
+
+        self._accuracy_place_target_button = qt.QPushButton("Place Point")
+        self._accuracy_place_target_button.setCheckable(True)
+        self._accuracy_place_target_button.setToolTip(
+            "Click a slice or 3D view to drop a target at the cursor position. "
+            "Stays active so you can place several; click again to stop."
+        )
+        self._accuracy_place_target_button.toggled.connect(self._on_accuracy_place_toggled)
+        self._accuracy_place_target_button.setSizePolicy(
+            qt.QSizePolicy.Fixed, qt.QSizePolicy.Fixed
+        )
+        target_row.addWidget(self._accuracy_place_target_button, 0)
+
+        self._accuracy_remove_target_button = qt.QPushButton("Remove Selected")
+        self._accuracy_remove_target_button.clicked.connect(self._on_accuracy_remove_selected)
+        target_row.addWidget(self._accuracy_remove_target_button, 0)
+
+        self._accuracy_clear_target_button = qt.QPushButton("Clear All")
+        self._accuracy_clear_target_button.clicked.connect(self._on_accuracy_clear_all)
+        target_row.addWidget(self._accuracy_clear_target_button, 0)
+        target_row.addStretch(1)
+        layout.addLayout(target_row)
+
+        # --- Target list ---
+        self._accuracy_target_list_widget = qt.QListWidget()
+        self._accuracy_target_list_widget.setMaximumHeight(150)
+        layout.addWidget(self._accuracy_target_list_widget)
+
+        # --- Measurement controls ---
+        measure_row = qt.QHBoxLayout()
+        measure_row.setContentsMargins(0, 0, 0, 0)
+        measure_row.setSpacing(6)
+
+        self._accuracy_start_button = qt.QPushButton("Start Accuracy Check")
+        self._accuracy_start_button.clicked.connect(self._on_accuracy_start_check)
+        measure_row.addWidget(self._accuracy_start_button, 1)
+
+        self._accuracy_record_button = qt.QPushButton("Record Measurement")
+        self._accuracy_record_button.setEnabled(False)
+        self._accuracy_record_button.clicked.connect(self._on_accuracy_record_measurement)
+        measure_row.addWidget(self._accuracy_record_button, 1)
+        layout.addLayout(measure_row)
+
+        # --- Status label ---
+        self._accuracy_status_label = qt.QLabel("Add target points to begin.")
+        self._accuracy_status_label.setWordWrap(True)
+        self._accuracy_status_label.setStyleSheet("color: #9fb4d8; font-weight: 600;")
+        layout.addWidget(self._accuracy_status_label)
+
+        # --- Results table ---
+        self._accuracy_results_table = qt.QTableWidget()
+        self._accuracy_results_table.setColumnCount(5)
+        self._accuracy_results_table.setHorizontalHeaderLabels(
+            ["Target", "Error (mm)", "Angle (°)", "Angle Bin", "Timestamp"]
+        )
+        self._accuracy_results_table.setMaximumHeight(150)
+        self._accuracy_results_table.verticalHeader().setVisible(False)
+        try:
+            self._accuracy_results_table.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        self._accuracy_results_table.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self._accuracy_results_table.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        layout.addWidget(self._accuracy_results_table)
+
+        # --- Save row ---
+        self._accuracy_save_button = qt.QPushButton("Save Results (CSV)")
+        self._accuracy_save_button.setEnabled(False)
+        self._accuracy_save_button.clicked.connect(self._on_accuracy_save_csv)
+        layout.addWidget(self._accuracy_save_button)
+
+        return group
+
+    # ----- Accuracy fiducial / measurement helpers -----
+
+    def _accuracy_get_or_create_fiducial_node(self):
+        """Return the AccuracyTargets fiducial node, creating it if needed."""
+        node = self._accuracy_target_fiducial_node
+        if node is not None:
+            try:
+                if node.GetScene() is None:
+                    node = None
+            except Exception:
+                node = None
+        if node is None:
+            node = slicer.util.getFirstNodeByClassByName(
+                "vtkMRMLMarkupsFiducialNode", "AccuracyTargets"
+            )
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", "AccuracyTargets"
+            )
+        if self._accuracy_target_fiducial_node is not node:
+            self._accuracy_target_fiducial_node = node
+            self._accuracy_attach_fiducial_observer(node)
+        return node
+
+    def _accuracy_attach_fiducial_observer(self, node):
+        """Observe PointModifiedEvent on the fiducial node so cursor-placed
+        points trigger a target-list refresh."""
+        if node is None:
+            return
+        # Detach from the PREVIOUS node (VTK observer tags are per-object;
+        # removing the old tag from the new node would leak the old observer
+        # and could remove an unrelated observer that happens to share the
+        # tag value on the new node).
+        self._accuracy_detach_fiducial_observer()
+        try:
+            event_id = slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent
+        except Exception:
+            event_id = vtk.vtkCommand.ModifiedEvent
+        try:
+            self._accuracy_fiducial_observer_tag = node.AddObserver(
+                event_id, self._on_accuracy_fiducial_modified
+            )
+            self._accuracy_fiducial_observed_node = node
+        except Exception:
+            self._accuracy_fiducial_observer_tag = None
+            self._accuracy_fiducial_observed_node = None
+
+    def _accuracy_detach_fiducial_observer(self):
+        node = self._accuracy_fiducial_observed_node
+        tag = self._accuracy_fiducial_observer_tag
+        if node is not None and tag is not None:
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+        self._accuracy_fiducial_observer_tag = None
+        self._accuracy_fiducial_observed_node = None
+
+    def _on_accuracy_fiducial_modified(self, _caller=None, _event=None):
+        """Refresh the target list when a control point is added/moved (e.g.
+        after a cursor click in placement mode)."""
+        self._accuracy_refresh_target_list()
+        # NB: .checked (property), not .isChecked — in PythonQt the latter is
+        # the unbound method object, which is always truthy.
+        if self._accuracy_place_target_button is not None and self._accuracy_place_target_button.checked:
+            count = self._accuracy_target_count()
+            self._accuracy_set_status(
+                f"Placed {count} target(s). Click another view to add more, "
+                "or toggle off to stop."
+            )
+
+    def _accuracy_get_pointer_position(self) -> Optional[tuple[float, float, float]]:
+        """Read the PointerToCT translation column as an (x, y, z) tuple."""
+        node = slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLTransformNode", _DEFAULT_POINTER_TO_CT_NAME
+        )
+        if node is None:
+            return None
+        matrix = vtk.vtkMatrix4x4()
+        try:
+            node.GetMatrixTransformToParent(matrix)
+        except Exception:
+            return None
+        return (
+            float(matrix.GetElement(0, 3)),
+            float(matrix.GetElement(1, 3)),
+            float(matrix.GetElement(2, 3)),
+        )
+
+    def _accuracy_get_pointer_angle_deg(self) -> Optional[float]:
+        """Angle (deg) between the pointer's tool axis (rotation Z column) and
+        the world vertical axis [0, 0, 1]."""
+        node = slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLTransformNode", _DEFAULT_POINTER_TO_CT_NAME
+        )
+        if node is None:
+            return None
+        matrix = vtk.vtkMatrix4x4()
+        try:
+            node.GetMatrixTransformToParent(matrix)
+        except Exception:
+            return None
+        zx = float(matrix.GetElement(0, 2))
+        zy = float(matrix.GetElement(1, 2))
+        zz = float(matrix.GetElement(2, 2))
+        norm = math.sqrt(zx * zx + zy * zy + zz * zz)
+        if norm < 1e-9:
+            return None
+        # Dot product with [0,0,1] is just zz/norm.
+        cos_theta = max(-1.0, min(1.0, zz / norm))
+        return math.degrees(math.acos(cos_theta))
+
+    def _accuracy_classify_angle(self, deg: float) -> str:
+        if deg < 30.0:
+            return "0–30°"
+        if deg < 60.0:
+            return "30–60°"
+        return "60–90°"
+
+    def _accuracy_set_status(self, text: str):
+        if self._accuracy_status_label is not None:
+            self._accuracy_status_label.setText(text)
+
+    def _accuracy_refresh_target_list(self):
+        """Rebuild the target QListWidget from the fiducial node's control points."""
+        list_widget = self._accuracy_target_list_widget
+        if list_widget is None:
+            return
+        list_widget.clear()
+        node = self._accuracy_target_fiducial_node
+        if node is None:
+            return
+        try:
+            count = int(node.GetNumberOfControlPoints())
+        except Exception:
+            count = 0
+        for i in range(count):
+            pos = [0.0, 0.0, 0.0]
+            try:
+                node.GetNthControlPointPositionWorld(i, pos)
+            except Exception:
+                pass
+            try:
+                label = str(node.GetNthControlPointLabel(i) or f"T{i + 1}")
+            except Exception:
+                label = f"T{i + 1}"
+            item = qt.QListWidgetItem(
+                f"{label}    ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
+            )
+            # Highlight the active target during a check.
+            if (
+                self._accuracy_check_active
+                and i == self._accuracy_current_target_index
+            ):
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(qt.QBrush(qt.QColor("#5ddca5")))
+            list_widget.addItem(item)
+
+    def _accuracy_update_results_table(self):
+        table = self._accuracy_results_table
+        if table is None:
+            return
+        table.setRowCount(len(self._accuracy_measurements))
+        for row, m in enumerate(self._accuracy_measurements):
+            values = [
+                str(m.get("target_label", "")),
+                f"{float(m.get('error_mm', 0.0)):.3f}",
+                f"{float(m.get('angle_deg', 0.0)):.2f}",
+                str(m.get("angle_bin", "")),
+                str(m.get("timestamp", "")),
+            ]
+            for col, value in enumerate(values):
+                item = qt.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)
+                table.setItem(row, col, item)
+        if self._accuracy_save_button is not None:
+            self._accuracy_save_button.setEnabled(len(self._accuracy_measurements) > 0)
+
+    def _accuracy_target_count(self) -> int:
+        node = self._accuracy_target_fiducial_node
+        if node is None:
+            return 0
+        try:
+            return int(node.GetNumberOfControlPoints())
+        except Exception:
+            return 0
+
+    def _accuracy_get_target_position(self, index: int) -> Optional[tuple[float, float, float]]:
+        node = self._accuracy_target_fiducial_node
+        if node is None or index < 0 or index >= self._accuracy_target_count():
+            return None
+        pos = [0.0, 0.0, 0.0]
+        try:
+            node.GetNthControlPointPositionWorld(index, pos)
+        except Exception:
+            return None
+        return (float(pos[0]), float(pos[1]), float(pos[2]))
+
+    def _accuracy_get_target_label(self, index: int) -> str:
+        node = self._accuracy_target_fiducial_node
+        if node is None:
+            return f"T{index + 1}"
+        try:
+            return str(node.GetNthControlPointLabel(index) or f"T{index + 1}")
+        except Exception:
+            return f"T{index + 1}"
+
+    # ----- Button handlers -----
+
+    def _on_accuracy_place_toggled(self, checked: bool):
+        """Enter or leave Slicer's interactive markups placement mode for the
+        accuracy fiducial node. While active, clicks in any slice / 3D view
+        drop a target at the cursor."""
+        try:
+            interaction_node = slicer.mrmlScene.GetNodeByID("vtkMRMLInteractionNodeSingleton")
+        except Exception:
+            interaction_node = None
+        try:
+            selection_node = slicer.mrmlScene.GetNodeByID("vtkMRMLSelectionNodeSingleton")
+        except Exception:
+            selection_node = None
+        if interaction_node is None or selection_node is None:
+            slicer.util.warningDisplay(
+                "Slicer interaction nodes are not ready yet.",
+                "Accuracy Assessment",
+                parent=self._active_modal_parent(),
+            )
+            if self._accuracy_place_target_button is not None:
+                was_blocked = self._accuracy_place_target_button.blockSignals(True)
+                self._accuracy_place_target_button.setChecked(False)
+                self._accuracy_place_target_button.blockSignals(was_blocked)
+            return
+
+        if checked:
+            node = self._accuracy_get_or_create_fiducial_node()
+            try:
+                selection_node.SetReferenceActivePlaceNodeClassName("vtkMRMLMarkupsFiducialNode")
+                selection_node.SetActivePlaceNodeID(node.GetID())
+            except Exception:
+                pass
+            try:
+                interaction_node.SetPlaceModePersistence(1)
+                interaction_node.SwitchToPersistentPlaceMode()
+            except Exception:
+                try:
+                    interaction_node.SetCurrentInteractionMode(
+                        slicer.vtkMRMLInteractionNode.Place
+                    )
+                except Exception:
+                    pass
+            self._accuracy_set_status(
+                "Placement mode ON. Click in a slice or 3D view to drop targets. "
+                "Toggle the button off to stop."
+            )
+        else:
+            try:
+                interaction_node.SetPlaceModePersistence(0)
+                interaction_node.SwitchToViewTransformMode()
+            except Exception:
+                try:
+                    interaction_node.SetCurrentInteractionMode(
+                        slicer.vtkMRMLInteractionNode.ViewTransform
+                    )
+                except Exception:
+                    pass
+            count = self._accuracy_target_count()
+            if count > 0:
+                self._accuracy_set_status(
+                    f"Placement mode OFF. {count} target(s) recorded."
+                )
+            else:
+                self._accuracy_set_status("Placement mode OFF.")
+
+    def _on_accuracy_remove_selected(self):
+        list_widget = self._accuracy_target_list_widget
+        node = self._accuracy_target_fiducial_node
+        if list_widget is None or node is None:
+            return
+        row = list_widget.currentRow
+        if row is None or row < 0:
+            return
+        try:
+            node.RemoveNthControlPoint(int(row))
+        except Exception:
+            try:
+                # Older Slicer API
+                node.RemoveMarkup(int(row))
+            except Exception:
+                logging.exception("Failed to remove accuracy target")
+                return
+        # Keep the mid-check target index pointing at the same PHYSICAL
+        # target: removing a row before the active one shifts all later
+        # indices down by one — without this the operator would be prompted
+        # for one target while Record measures against another.
+        if self._accuracy_check_active and int(row) < self._accuracy_current_target_index:
+            self._accuracy_current_target_index -= 1
+        # If we are mid-check and the active index is now invalid, cancel the check.
+        if self._accuracy_check_active and self._accuracy_current_target_index >= self._accuracy_target_count():
+            self._accuracy_check_active = False
+            self._accuracy_current_target_index = 0
+            if self._accuracy_record_button is not None:
+                self._accuracy_record_button.setEnabled(False)
+            if self._accuracy_start_button is not None:
+                self._accuracy_start_button.setEnabled(True)
+            self._accuracy_set_status("Accuracy check cancelled (target removed).")
+        elif self._accuracy_check_active and int(row) == self._accuracy_current_target_index:
+            # The active target itself was removed — re-prompt for the target
+            # that now occupies this index so the operator is not misled.
+            self._accuracy_set_status(
+                f"Target removed. Touch target T{self._accuracy_current_target_index + 1} "
+                "and hold steady, then click Record."
+            )
+        self._accuracy_refresh_target_list()
+
+    def _on_accuracy_clear_all(self):
+        node = self._accuracy_target_fiducial_node
+        if node is not None:
+            try:
+                node.RemoveAllControlPoints()
+            except Exception:
+                try:
+                    node.RemoveAllMarkups()
+                except Exception:
+                    logging.exception("Failed to clear accuracy targets")
+        self._accuracy_measurements = []
+        self._accuracy_check_active = False
+        self._accuracy_current_target_index = 0
+        if self._accuracy_record_button is not None:
+            self._accuracy_record_button.setEnabled(False)
+        if self._accuracy_start_button is not None:
+            self._accuracy_start_button.setEnabled(True)
+        self._accuracy_refresh_target_list()
+        self._accuracy_update_results_table()
+        self._accuracy_set_status("Cleared all targets and measurements.")
+
+    def _on_accuracy_start_check(self):
+        if self._accuracy_target_count() <= 0:
+            slicer.util.warningDisplay(
+                "Add at least one target point before starting the accuracy check.",
+                "Accuracy Assessment",
+                parent=self._active_modal_parent(),
+            )
+            return
+        # Reset measurements for a fresh run.
+        self._accuracy_measurements = []
+        self._accuracy_update_results_table()
+        self._accuracy_check_active = True
+        self._accuracy_current_target_index = 0
+        if self._accuracy_record_button is not None:
+            self._accuracy_record_button.setEnabled(True)
+        if self._accuracy_start_button is not None:
+            self._accuracy_start_button.setEnabled(False)
+        label = self._accuracy_get_target_label(0)
+        self._accuracy_set_status(f"Touch target {label} and hold steady, then click Record.")
+        self._accuracy_refresh_target_list()
+
+    def _on_accuracy_record_measurement(self):
+        if not self._accuracy_check_active:
+            return
+        index = self._accuracy_current_target_index
+        target_pos = self._accuracy_get_target_position(index)
+        if target_pos is None:
+            self._accuracy_set_status("Target position unavailable; aborting check.")
+            self._accuracy_check_active = False
+            if self._accuracy_record_button is not None:
+                self._accuracy_record_button.setEnabled(False)
+            if self._accuracy_start_button is not None:
+                self._accuracy_start_button.setEnabled(True)
+            return
+        measured = self._accuracy_get_pointer_position()
+        if measured is None:
+            slicer.util.warningDisplay(
+                "PointerToCT transform is not available. Initialize tracking first.",
+                "Accuracy Assessment",
+                parent=self._active_modal_parent(),
+            )
+            return
+        angle_deg = self._accuracy_get_pointer_angle_deg()
+        if angle_deg is None:
+            angle_deg = 0.0
+        angle_bin = self._accuracy_classify_angle(float(angle_deg))
+        dx = measured[0] - target_pos[0]
+        dy = measured[1] - target_pos[1]
+        dz = measured[2] - target_pos[2]
+        error_mm = math.sqrt(dx * dx + dy * dy + dz * dz)
+        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        label = self._accuracy_get_target_label(index)
+        self._accuracy_measurements.append({
+            "target_label": label,
+            "target_ras": [target_pos[0], target_pos[1], target_pos[2]],
+            "measured_ras": [measured[0], measured[1], measured[2]],
+            "error_mm": float(error_mm),
+            "angle_deg": float(angle_deg),
+            "angle_bin": angle_bin,
+            "timestamp": timestamp,
+        })
+        self._accuracy_update_results_table()
+
+        # Advance to the next target or finish.
+        next_index = index + 1
+        if next_index < self._accuracy_target_count():
+            self._accuracy_current_target_index = next_index
+            next_label = self._accuracy_get_target_label(next_index)
+            self._accuracy_set_status(
+                f"Recorded {label} (error {error_mm:.3f} mm). "
+                f"Touch target {next_label} and hold steady, then click Record."
+            )
+            self._accuracy_refresh_target_list()
+        else:
+            self._accuracy_check_active = False
+            self._accuracy_current_target_index = 0
+            if self._accuracy_record_button is not None:
+                self._accuracy_record_button.setEnabled(False)
+            if self._accuracy_start_button is not None:
+                self._accuracy_start_button.setEnabled(True)
+            errors = [float(m["error_mm"]) for m in self._accuracy_measurements]
+            mean_err = sum(errors) / len(errors) if errors else 0.0
+            max_err = max(errors) if errors else 0.0
+            if len(errors) > 1:
+                variance = sum((e - mean_err) ** 2 for e in errors) / (len(errors) - 1)
+                std_err = math.sqrt(variance)
+            else:
+                std_err = 0.0
+            self._accuracy_set_status(
+                f"Done. Mean: {mean_err:.3f} mm | Max: {max_err:.3f} mm | "
+                f"Std dev: {std_err:.3f} mm  ({len(errors)} measurement(s))"
+            )
+            self._accuracy_refresh_target_list()
+
+    def _on_accuracy_save_csv(self):
+        if not self._accuracy_measurements:
+            return
+        path = qt.QFileDialog.getSaveFileName(
+            self._active_modal_parent(),
+            "Save Accuracy Results",
+            "accuracy_results.csv",
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fp:
+                writer = csv.writer(fp)
+                writer.writerow([
+                    "Target",
+                    "Target_X", "Target_Y", "Target_Z",
+                    "Measured_X", "Measured_Y", "Measured_Z",
+                    "Error_mm",
+                    "Angle_deg",
+                    "Angle_bin",
+                    "Timestamp",
+                ])
+                errors = []
+                for m in self._accuracy_measurements:
+                    target = m.get("target_ras", [0.0, 0.0, 0.0])
+                    measured = m.get("measured_ras", [0.0, 0.0, 0.0])
+                    error_mm = float(m.get("error_mm", 0.0))
+                    errors.append(error_mm)
+                    writer.writerow([
+                        m.get("target_label", ""),
+                        f"{float(target[0]):.6f}",
+                        f"{float(target[1]):.6f}",
+                        f"{float(target[2]):.6f}",
+                        f"{float(measured[0]):.6f}",
+                        f"{float(measured[1]):.6f}",
+                        f"{float(measured[2]):.6f}",
+                        f"{error_mm:.6f}",
+                        f"{float(m.get('angle_deg', 0.0)):.6f}",
+                        m.get("angle_bin", ""),
+                        m.get("timestamp", ""),
+                    ])
+                mean_err = sum(errors) / len(errors) if errors else 0.0
+                writer.writerow([
+                    "SUMMARY", "", "", "", "", "", "",
+                    f"{mean_err:.6f}", "", "", "",
+                ])
+        except Exception as exc:
+            logging.exception("Failed to save accuracy CSV")
+            slicer.util.errorDisplay(
+                f"Failed to save CSV: {exc}",
+                parent=self._active_modal_parent(),
+            )
+            return
+        slicer.util.infoDisplay(
+            f"Accuracy results saved to:\n{path}",
+            "Accuracy Assessment",
+            parent=self._active_modal_parent(),
+        )
+
+    def _build_additional_settings_dialog(self):
+        if self._additional_settings_dialog is not None:
+            return
+
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.objectName = "AdditionalSettingsDialog"
+        dialog.windowTitle = "Additional Settings"
+        dialog.setModal(True)
+        dialog.setMinimumWidth(560)
+
+        dialog_layout = qt.QVBoxLayout(dialog)
+        dialog_layout.setContentsMargins(16, 16, 16, 16)
+        dialog_layout.setSpacing(12)
+
+        title = qt.QLabel("Additional Settings")
+        title.objectName = "AdditionalSettingsTitle"
+        dialog_layout.addWidget(title)
+        dialog_layout.addWidget(self._create_guidance_additional_settings_content())
+
+        close_button = qt.QPushButton("Close")
+        close_button.objectName = "LegacySecondaryButton"
+        close_button.clicked.connect(lambda _checked=False, d=dialog: d.close())
+        dialog_layout.addWidget(close_button)
+
+        self._additional_settings_dialog = dialog
+
+    def _create_guidance_additional_settings_content(self):
+        content = qt.QWidget()
+        content_layout = qt.QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+
+        self._ct_transform_name = qt.QLineEdit()
+        self._ct_transform_name.setPlaceholderText(_DEFAULT_REFERENCE_TO_CT_NAME)
+        content_layout.addWidget(self._create_legacy_form_row("ReferenceToCT", self._ct_transform_name))
+
+        self._needle_transform_name = qt.QLineEdit()
+        self._needle_transform_name.setPlaceholderText(_DEFAULT_POINTER_TO_CT_NAME)
+        content_layout.addWidget(self._create_legacy_form_row("PointerToCT", self._needle_transform_name))
+
+        self._invert_registration_matrix = qt.QCheckBox("Invert registration matrix before apply")
+        self._invert_registration_matrix.checked = False
+        self._invert_registration_matrix.setToolTip(
+            "Enable this only when the input file stores CT->Reference and must be inverted to ReferenceToCT."
+        )
+        content_layout.addWidget(self._invert_registration_matrix)
+
+        # Tracking jitter smoothing control.
+        smoothing_row = qt.QHBoxLayout()
+        smoothing_row.setContentsMargins(0, 0, 0, 0)
+        smoothing_row.setSpacing(8)
+        smoothing_tooltip = (
+            "Damp tracker jitter so the needle/tool model and slice views stop shaking. "
+            "Higher smoothing is steadier but adds a little lag. 0% disables smoothing."
+        )
+        smoothing_caption = qt.QLabel("Tool Smoothing")
+        smoothing_caption.setToolTip(smoothing_tooltip)
+        smoothing_row.addWidget(smoothing_caption, 0)
+        self._smoothing_slider = qt.QSlider(qt.Qt.Horizontal)
+        self._smoothing_slider.setMinimum(0)
+        self._smoothing_slider.setMaximum(100)
+        self._smoothing_slider.setSingleStep(5)
+        self._smoothing_slider.setPageStep(10)
+        self._smoothing_slider.setValue(int(round(_DEFAULT_SMOOTHING_STRENGTH * 100)))
+        self._smoothing_slider.setToolTip(smoothing_tooltip)
+        smoothing_row.addWidget(self._smoothing_slider, 1)
+        self._smoothing_value_label = qt.QLabel("")
+        self._smoothing_value_label.setMinimumWidth(40)
+        self._smoothing_value_label.setAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        smoothing_row.addWidget(self._smoothing_value_label, 0)
+        content_layout.addLayout(smoothing_row)
+        self._smoothing_slider.valueChanged.connect(self._on_smoothing_slider_changed)
+
+        utilities = qt.QWidget()
+        utilities_layout = qt.QGridLayout(utilities)
+        utilities_layout.setContentsMargins(0, 0, 0, 0)
+        utilities_layout.setHorizontalSpacing(10)
+        utilities_layout.setVerticalSpacing(10)
+
+        self._open_openigtlink_button = qt.QPushButton("OpenIGTLink")
+        self._open_openigtlink_button.objectName = "LegacySecondaryButton"
+        self._open_openigtlink_button.setToolTip("Open the OpenIGTLinkIF module for connector/debug inspection.")
+        self._open_openigtlink_button.clicked.connect(self._on_open_openigtlink_clicked)
+        utilities_layout.addWidget(self._open_openigtlink_button, 0, 0)
+
+        self._open_transforms_button = qt.QPushButton("Transforms")
+        self._open_transforms_button.objectName = "LegacySecondaryButton"
+        self._open_transforms_button.setToolTip("Open the Transforms module for transform/debug inspection.")
+        self._open_transforms_button.clicked.connect(self._on_open_transforms_clicked)
+        utilities_layout.addWidget(self._open_transforms_button, 0, 1)
+
+        content_layout.addWidget(utilities)
+
+        self._ct_transform_name.textChanged.connect(self._on_settings_fields_changed)
+        self._needle_transform_name.textChanged.connect(self._on_settings_fields_changed)
+        self._invert_registration_matrix.toggled.connect(self._on_settings_fields_changed)
+        self._update_smoothing_value_label(self._smoothing_slider.value)
+        return content
+
+    def _update_smoothing_value_label(self, percent: int):
+        if self._smoothing_value_label is None:
+            return
+        percent = int(percent)
+        self._smoothing_value_label.setText("Off" if percent <= 0 else f"{percent}%")
+
+    def _on_smoothing_slider_changed(self, value: int):
+        self._update_smoothing_value_label(value)
+        strength = max(0.0, min(1.0, float(value) / 100.0))
+        if getattr(self, "logic", None) is not None:
+            try:
+                self.logic.set_smoothing_strength(strength)
+            except Exception:
+                pass
+        if not self._suspend_settings_updates:
+            qt.QSettings().setValue(_SETTINGS_PREFIX + "SmoothingStrength", strength)
+
+    def _on_open_additional_settings_clicked(self):
+        self._build_additional_settings_dialog()
+        if self._additional_settings_dialog is None:
+            return
+        self._additional_settings_dialog.exec()
+
+    def _create_header_panel(self):
+        header = qt.QFrame()
+        header.objectName = "ConsoleHeader"
+
+        header_layout = qt.QVBoxLayout(header)
+        header_layout.setContentsMargins(16, 16, 16, 16)
+        header_layout.setSpacing(10)
+
+        top_row = qt.QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+
+        for resource_path, size in ((":/Logo.png", 40), (":/Icons/Medium/DesktopIcon.png", 32)):
+            badge = qt.QLabel()
+            badge.setProperty("brandBadge", True)
+            badge.setAlignment(qt.Qt.AlignCenter)
+            badge.setFixedSize(50, 50)
+            pixmap = qt.QPixmap(resource_path)
+            if not pixmap.isNull():
+                badge.setPixmap(pixmap.scaled(size, size, qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation))
+            top_row.addWidget(badge, 0)
+
+        top_row.addStretch(1)
+
+        self._home_settings_button = qt.QPushButton("Workspace Settings")
+        self._home_settings_button.objectName = "TopActionButton"
+        self._home_settings_button.setIcon(self._tinted_icon("Icons/Gears.png", "#ffffff"))
+        self._home_settings_button.setToolTip("Open workspace settings.")
+        self._home_settings_button.clicked.connect(self.raiseSettings)
+        top_row.addWidget(self._home_settings_button, 0)
+        header_layout.addLayout(top_row)
+
+        stages = qt.QWidget()
+        stages_layout = qt.QHBoxLayout(stages)
+        stages_layout.setContentsMargins(0, 0, 0, 0)
+        stages_layout.setSpacing(8)
+        for text, active in (("MODALITY", False), ("NAVIGATE", True), ("EXECUTE", False)):
+            label = qt.QLabel(text)
+            label.setProperty("stageLabel", True)
+            label.setProperty("stageActive", active)
+            label.setAlignment(qt.Qt.AlignCenter)
+            stages_layout.addWidget(label, 1)
+        header_layout.addWidget(stages)
+
+        eyebrow = qt.QLabel("NAVIGATION CONSOLE")
+        eyebrow.objectName = "PanelEyebrow"
+        header_layout.addWidget(eyebrow)
+
+        title = qt.QLabel("TrackVision Home")
+        title.objectName = "PanelTitle"
+        header_layout.addWidget(title)
+
+        subtitle = qt.QLabel(
+            "Detailed study paths, registration inputs, and PLUS endpoints now live in Workspace Settings while this panel stays focused on execution."
+        )
+        subtitle.objectName = "PanelSubtitle"
+        subtitle.wordWrap = True
+        header_layout.addWidget(subtitle)
+        return header
+
+    def _create_mode_switch(self):
+        switcher = qt.QFrame()
+        switcher.objectName = "ModeSwitcher"
+
+        switcher_layout = qt.QHBoxLayout(switcher)
+        switcher_layout.setContentsMargins(4, 4, 4, 4)
+        switcher_layout.setSpacing(4)
+
+        for mode_key, label_text in (("auto", "Auto"), ("manual", "Manual")):
+            button = qt.QPushButton(label_text)
+            button.objectName = "ModeButton"
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.clicked.connect(lambda _checked=False, mode=mode_key: self._set_workflow_mode(mode))
+            self._mode_buttons[mode_key] = button
+            switcher_layout.addWidget(button, 1)
+
+        return switcher
+
+    def _set_workflow_mode(self, mode: str):
+        if self._mode_stack is None:
+            return
+
+        self._mode_stack.setCurrentIndex(0 if mode == "auto" else 1)
+        for mode_key, button in self._mode_buttons.items():
+            was_blocked = button.blockSignals(True)
+            button.setChecked(mode_key == mode)
+            button.blockSignals(was_blocked)
+
+    def _set_tracking_view_mode(self, mode: str, save_setting: bool = True):
+        normalized = _normalize_tracking_view_mode(mode)
+        self._tracking_view_mode = normalized
+
+        for button, target_mode in (
+            (self._tool_centric_button, "tool_centric"),
+            (self._scan_centric_button, "scan_centric"),
+            (self._tool_dynamic_button, "tool_dynamic"),
+        ):
+            if button is None:
+                continue
+            is_selected = target_mode == normalized
+            was_blocked = button.blockSignals(True)
+            button.setChecked(is_selected)
+            button.blockSignals(was_blocked)
+            button.setProperty("trackingSelected", is_selected)
+            try:
+                button.style().unpolish(button)
+                button.style().polish(button)
+            except Exception:
+                pass
+            try:
+                button.setStyleSheet(
+                    _TRACKING_MODE_BUTTON_SELECTED_STYLE
+                    if is_selected
+                    else _TRACKING_MODE_BUTTON_UNSELECTED_STYLE
+                )
+            except Exception:
+                pass
+            try:
+                button.update()
+            except Exception:
+                pass
+
+        if save_setting:
+            settings = qt.QSettings()
+            settings.setValue(_SETTINGS_PREFIX + "TrackingViewMode", normalized)
+
+        if getattr(self, "logic", None) is not None:
+            try:
+                self.logic.set_tracking_view_mode(normalized)
+            except Exception:
+                pass
+
+        # Re-run the full Volume Reslice Driver setup on every mode switch so
+        # the 2D views match the appearance the user sees after clicking the
+        # "Volume Reslicer" button — including scan-centric fit-to-background
+        # and zoom adjustments. Falls back to a light-touch driver-binding
+        # refresh if the full setup raises (e.g. CT or needle not ready yet).
+        try:
+            self._configure_volume_reslice_driver()
+        except Exception:
+            self._refresh_volume_reslice_driver_bindings()
+
+    def _refresh_volume_reslice_driver_bindings(self):
+        """Re-apply the current tracking view mode to the slice driver so 2D views
+        stay live after mode changes, without requiring the user to reopen the
+        Volume Reslicer module. No-op if no needle transform is present yet."""
+        try:
+            if not hasattr(slicer.modules, "volumereslicedriver"):
+                return
+            # Find the needle transform — this is the only precondition we need.
+            # We do NOT gate on logic.is_running() because the Init Tracking
+            # button launches PlusServer directly and leaves logic._phase idle.
+            needle_transform = self._find_needle_transform_for_reslicing()
+            if needle_transform is None:
+                return
+            reslice_logic = slicer.modules.volumereslicedriver.logic()
+            if reslice_logic is None:
+                return
+            layout_manager = slicer.app.layoutManager()
+            if layout_manager is None:
+                return
+            should_drive_slices = self._tracking_view_mode in (
+                "tool_centric", "scan_centric", "tool_dynamic"
+            )
+            mode_map = _slice_driver_mode_map_for_tracking_view_mode(self._tracking_view_mode)
+            for view_name, mode in mode_map:
+                try:
+                    slice_widget = layout_manager.sliceWidget(view_name)
+                    if slice_widget is None:
+                        continue
+                    slice_node = slice_widget.mrmlSliceNode()
+                    if slice_node is None:
+                        continue
+                    if should_drive_slices:
+                        reslice_logic.SetDriverForSlice(needle_transform.GetID(), slice_node)
+                        reslice_logic.SetModeForSlice(int(mode), slice_node)
+                    else:
+                        reslice_logic.SetDriverForSlice("", slice_node)
+                except Exception:
+                    continue
+        except Exception:
+            # Best-effort only — never let a refresh failure break mode switching
+            pass
+
+    def _find_needle_transform_for_reslicing(self):
+        """Locate the needle/pointer transform node for slice-driver binding.
+        Tries the configured PointerToCT name first, then falls back to common
+        names used by the internal PlusServer pipeline so mode-switch works
+        regardless of which launch path started tracking."""
+        candidates = []
+        try:
+            configured = self._current_pointer_to_ct_name()
+            if configured:
+                candidates.append(configured)
+        except Exception:
+            pass
+        candidates.extend([
+            _DEFAULT_POINTER_TO_CT_NAME,
+            _LIVE_POINTER_TO_TRACKER_NAME,
+            "PointerToPhantom",
+        ])
+        for name in candidates:
+            try:
+                node = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", name)
+                if node is not None:
+                    return node
+            except Exception:
+                continue
+        return None
+
+    def _create_session_summary_card(self):
+        card, body = self._create_card(
+            "Console Snapshot",
+            "Saved inputs and live scene state are merged here so the sidebar reflects what is actually loaded now.",
+        )
+
+        for key, label_text in (
+            ("study", "Study"),
+            ("needle", "Needle"),
+            ("registration", "Registration"),
+            ("stream", "Stream"),
+        ):
+            row = qt.QFrame()
+            row.setProperty("summaryRow", True)
+            row_layout = qt.QHBoxLayout(row)
+            row_layout.setContentsMargins(12, 10, 12, 10)
+            row_layout.setSpacing(10)
+
+            name_label = qt.QLabel(label_text)
+            name_label.setProperty("summaryName", True)
+            row_layout.addWidget(name_label, 0)
+
+            value_label = qt.QLabel("Not configured")
+            value_label.setProperty("summaryValue", True)
+            value_label.wordWrap = True
+            row_layout.addWidget(value_label, 1)
+            self._session_value_labels[key] = value_label
+            self._session_rows[key] = row
+
+            body.addWidget(row)
+
+        note = qt.QLabel("Rows turn live as volumes, models, transforms, and tracking streams appear in the scene.")
+        note.setProperty("summaryHint", True)
+        note.wordWrap = True
+        body.addWidget(note)
+        return card
+
+    def _create_auto_page(self):
+        card, body = self._create_card(
+            "Auto",
+            "Run the saved workspace with the smallest possible control surface.",
+        )
+
+        hint = qt.QLabel(
+            "Check the live snapshot above, then start navigation when the study, model, registration, and stream are ready."
+        )
+        hint.setProperty("pageHint", True)
+        hint.wordWrap = True
+        body.addWidget(hint)
+
+        actions = self._create_section_box()
+        actions_layout = qt.QVBoxLayout(actions)
+        actions_layout.setContentsMargins(12, 12, 12, 12)
+        actions_layout.setSpacing(10)
+
+        self._auto_start_button = qt.QPushButton("Start Navigate")
+        self._auto_start_button.objectName = "PrimaryButton"
+        self._auto_start_button.clicked.connect(self._on_start_clicked)
+        actions_layout.addWidget(self._auto_start_button)
+
+        self._auto_stop_button = qt.QPushButton("Stop Workflow")
+        self._auto_stop_button.objectName = "SecondaryButton"
+        self._auto_stop_button.clicked.connect(self._on_stop_clicked)
+        actions_layout.addWidget(self._auto_stop_button)
+        body.addWidget(actions)
+
+        settings_button = qt.QPushButton("Open Workspace Settings")
+        settings_button.objectName = "InlineButton"
+        settings_button.clicked.connect(self.raiseSettings)
+        body.addWidget(settings_button)
+        return card
+
+    def _create_manual_page(self):
+        card, body = self._create_card(
+            "Manual",
+            "Work through the live session step by step with a tighter operator sidebar.",
+        )
+
+        prepare_title = qt.QLabel("PREPARE")
+        prepare_title.setProperty("sectionTitle", True)
+        body.addWidget(prepare_title)
+
+        prepare_box = self._create_section_box()
+        prepare_layout = qt.QVBoxLayout(prepare_box)
+        prepare_layout.setContentsMargins(12, 12, 12, 12)
+        prepare_layout.setSpacing(8)
+
+        self._load_ct_button = qt.QPushButton("Import CT Study")
+        self._load_ct_button.objectName = "WorkflowButton"
+        self._load_ct_button.clicked.connect(self._on_load_ct_clicked)
+        self._load_ct_button.setToolTip("Load CT from the saved DICOM folder and enable volume rendering.")
+        prepare_layout.addWidget(self._load_ct_button)
+
+        self._load_needle_button = qt.QPushButton("Load Needle Model")
+        self._load_needle_button.objectName = "WorkflowButton"
+        self._load_needle_button.clicked.connect(self._on_load_needle_clicked)
+        self._load_needle_button.setToolTip("Load the saved STL model and attach it to the tracked transform.")
+        prepare_layout.addWidget(self._load_needle_button)
+
+        self._load_registration_button = qt.QPushButton("Register Matrix")
+        self._load_registration_button.objectName = "WorkflowButton"
+        self._load_registration_button.clicked.connect(self._on_load_registration_clicked)
+        self._load_registration_button.setToolTip("Load and apply the saved registration matrix file.")
+        prepare_layout.addWidget(self._load_registration_button)
+        body.addWidget(prepare_box)
+
+        navigate_title = qt.QLabel("NAVIGATE")
+        navigate_title.setProperty("sectionTitle", True)
+        body.addWidget(navigate_title)
+
+        navigate_box = self._create_section_box()
+        navigate_layout = qt.QVBoxLayout(navigate_box)
+        navigate_layout.setContentsMargins(12, 12, 12, 12)
+        navigate_layout.setSpacing(8)
+
+        self._start_button = qt.QPushButton("Start Navigate")
+        self._start_button.objectName = "PrimaryButton"
+        self._start_button.clicked.connect(self._on_start_clicked)
+        navigate_layout.addWidget(self._start_button)
+
+        self._stop_button = qt.QPushButton("Stop Workflow")
+        self._stop_button.objectName = "SecondaryButton"
+        self._stop_button.clicked.connect(self._on_stop_clicked)
+        navigate_layout.addWidget(self._stop_button)
+        body.addWidget(navigate_box)
+
+        tools_title = qt.QLabel("TOOLS")
+        tools_title.setProperty("sectionTitle", True)
+        body.addWidget(tools_title)
+
+        tools_box = self._create_section_box()
+        tools_layout = qt.QVBoxLayout(tools_box)
+        tools_layout.setContentsMargins(12, 12, 12, 12)
+        tools_layout.setSpacing(8)
+
+        utilities = qt.QWidget()
+        utilities_layout = qt.QGridLayout(utilities)
+        utilities_layout.setContentsMargins(0, 0, 0, 0)
+        utilities_layout.setHorizontalSpacing(8)
+        utilities_layout.setVerticalSpacing(8)
+
+        self._paste_registration_button = qt.QPushButton("Paste Matrix")
+        self._paste_registration_button.objectName = "UtilityButton"
+        self._paste_registration_button.clicked.connect(self._on_paste_registration_clicked)
+        utilities_layout.addWidget(self._paste_registration_button, 0, 0)
+
+        self._initialize_tracking_button = qt.QPushButton("Init Tracking")
+        self._initialize_tracking_button.objectName = "UtilityButton"
+        self._initialize_tracking_button.setToolTip(
+            "Connect to the OpenIGTLink tracker stream. If no stream is live yet, TrackVision will try to start the configured PLUS tracker server."
+        )
+        self._initialize_tracking_button.clicked.connect(self._on_initialize_tracking_clicked)
+        utilities_layout.addWidget(self._initialize_tracking_button, 0, 1)
+
+        self._open_reslicer_button = qt.QPushButton("Volume Reslicer")
+        self._open_reslicer_button.objectName = "UtilityButton"
+        self._open_reslicer_button.clicked.connect(self._on_open_reslicer_clicked)
+        utilities_layout.addWidget(self._open_reslicer_button, 1, 0)
+
+        self._open_openigtlink_button = qt.QPushButton("OpenIGTLink")
+        self._open_openigtlink_button.objectName = "UtilityButton"
+        self._open_openigtlink_button.setToolTip("Open the OpenIGTLinkIF module for connector/debug inspection.")
+        self._open_openigtlink_button.clicked.connect(self._on_open_openigtlink_clicked)
+        utilities_layout.addWidget(self._open_openigtlink_button, 1, 1)
+
+        self._open_transforms_button = qt.QPushButton("Transforms")
+        self._open_transforms_button.objectName = "UtilityButton"
+        self._open_transforms_button.setToolTip("Open the Transforms module for transform/debug inspection.")
+        self._open_transforms_button.clicked.connect(self._on_open_transforms_clicked)
+        utilities_layout.addWidget(self._open_transforms_button, 2, 0)
+
+        settings_button = qt.QPushButton("Workspace Settings")
+        settings_button.objectName = "InlineButton"
+        settings_button.clicked.connect(self.raiseSettings)
+        utilities_layout.addWidget(settings_button, 2, 1)
+
+        tools_layout.addWidget(utilities)
+        body.addWidget(tools_box)
+        return card
+
+    def _create_card(self, title_text: str, description_text: Optional[str] = None):
+        card = qt.QFrame()
+        card.setProperty("card", True)
+        card_layout = qt.QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(8)
+
+        title = qt.QLabel(title_text)
+        title.setProperty("cardTitle", True)
+        card_layout.addWidget(title)
+
+        if description_text:
+            description = qt.QLabel(description_text)
+            description.setProperty("cardDescription", True)
+            description.setWordWrap(True)
+            card_layout.addWidget(description)
+
+        body = qt.QVBoxLayout()
+        body.setContentsMargins(0, 4, 0, 0)
+        body.setSpacing(10)
+        card_layout.addLayout(body)
+        return card, body
+
+    def _create_section_box(self):
+        box = qt.QFrame()
+        box.setProperty("sectionBox", True)
+        return box
+
+    def _create_status_card(self):
+        card = qt.QFrame()
+        card.setProperty("card", True)
+        card_layout = qt.QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(8)
+
+        title = qt.QLabel("Live Status")
+        title.setProperty("cardTitle", True)
+        card_layout.addWidget(title)
+
+        subtitle = qt.QLabel("Compact health indicators for the active session.")
+        subtitle.setProperty("cardDescription", True)
+        subtitle.setWordWrap(True)
+        card_layout.addWidget(subtitle)
+
+        self._busy_indicator = qt.QProgressBar()
+        self._busy_indicator.objectName = "BusyIndicator"
+        self._busy_indicator.setRange(0, 0)
+        self._busy_indicator.setTextVisible(False)
+        self._busy_indicator.visible = False
+        self._busy_indicator.setFixedHeight(6)
+        card_layout.addWidget(self._busy_indicator)
+
+        status_grid_widget = qt.QWidget()
+        status_grid = qt.QGridLayout(status_grid_widget)
+        status_grid.setContentsMargins(0, 4, 0, 0)
+        status_grid.setHorizontalSpacing(10)
+        status_grid.setVerticalSpacing(10)
+
+        for key, label_text in (
+            ("launcher", "Launcher"),
+            ("server", "Server"),
+            ("ct", "CT"),
+            ("registration", "Registration"),
+            ("vr", "Volume Rendering"),
+            ("needle", "Needle"),
+            ("transforms", "Transforms"),
+            ("tracking", "Tracking"),
+        ):
+            self._status_titles[key] = label_text
+            index = len(self._status_titles) - 1
+
+            tile = qt.QFrame()
+            tile.setProperty("statusTile", True)
+            tile_layout = qt.QVBoxLayout(tile)
+            tile_layout.setContentsMargins(12, 10, 12, 10)
+            tile_layout.setSpacing(6)
+
+            header_row = qt.QHBoxLayout()
+            header_row.setContentsMargins(0, 0, 0, 0)
+            header_row.setSpacing(8)
+
+            dot = qt.QLabel("")
+            dot.setFixedSize(10, 10)
+            dot.setProperty("statusDot", True)
+            dot.setProperty("status", _StatusState.WAIT)
+            header_row.addWidget(dot, 0, qt.Qt.AlignVCenter)
+
+            name_label = qt.QLabel(label_text)
+            name_label.setProperty("statusName", True)
+            name_label.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
+            header_row.addWidget(name_label, 1)
+            tile_layout.addLayout(header_row)
+
+            label = qt.QLabel("-")
+            label.setProperty("status", _StatusState.WAIT)
+            label.setAlignment(qt.Qt.AlignLeft | qt.Qt.AlignTop)
+            label.setWordWrap(True)
+            self._status_labels[key] = label
+            self._status_dots[key] = dot
+            tile_layout.addWidget(label)
+
+            status_grid.addWidget(tile, index // 2, index % 2)
+
+        status_grid.setColumnStretch(0, 1)
+        status_grid.setColumnStretch(1, 1)
+        card_layout.addWidget(status_grid_widget)
+
+        self._error_label = qt.QLabel("")
+        self._error_label.setProperty("errorText", True)
+        self._error_label.setWordWrap(True)
+        self._error_label.visible = False
+        card_layout.addWidget(self._error_label)
+
+        return card, card_layout
+
+    def _set_status(self, key: str, state: str, text: str, sync_surface: bool = True):
+        # Skip the restyle below when nothing changed: this runs for every
+        # status key on each 700ms runtime refresh, and an unconditional
+        # unpolish/polish forces a full stylesheet re-resolve per widget on
+        # the GUI thread — a constant drag while tracking is live.
+        unchanged = (
+            self._status_state_values.get(key) == state
+            and self._status_text_values.get(key) == text
+        )
+        self._status_state_values[key] = state
+        self._status_text_values[key] = text
+
+        label = self._status_labels.get(key)
+        if label is None:
+            return
+        if unchanged:
+            if sync_surface:
+                self._sync_runtime_surface()
+            return
+        dot = self._status_dots.get(key)
+        title = self._status_titles.get(key, "")
+        display_text = text
+        if title:
+            prefix = f"{title}: "
+            if display_text.lower().startswith(prefix.lower()):
+                display_text = display_text[len(prefix):]
+
+        for widget in [label, dot]:
+            if widget is None:
+                continue
+            if widget is label:
+                widget.text = display_text
+            widget.setProperty("status", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
+
+        if sync_surface:
+            self._sync_runtime_surface()
+
+    def _current_workflow(self) -> Optional[SpineTrackerWorkflow]:
+        try:
+            workflow = self.logic._workflow
+        except Exception:
+            workflow = None
+        if workflow is None:
+            return None
+        return workflow
+
+    def _node_is_live(self, node) -> bool:
+        try:
+            return node is not None and node.GetScene() is not None
+        except Exception:
+            return False
+
+    def _workflow_is_running(self) -> bool:
+        try:
+            return bool(self.logic is not None and self.logic._workflow is not None and self.logic._workflow.is_running())
+        except Exception:
+            return False
+
+    def _decorate_runtime_widget(self, widget: Optional[qt.QPushButton], runtime_state: str, runtime_text: str = ""):
+        if widget is None:
+            return
+
+        if widget.property("baseToolTip") is None:
+            widget.setProperty("baseToolTip", widget.toolTip or "")
+
+        base_tooltip = widget.property("baseToolTip") or ""
+        if runtime_text:
+            new_tooltip = f"{base_tooltip}\nStatus: {runtime_text}" if base_tooltip else f"Status: {runtime_text}"
+        else:
+            new_tooltip = base_tooltip
+        if (widget.toolTip or "") != new_tooltip:
+            widget.setToolTip(new_tooltip)
+        # Restyle only on an actual state change — this runs for ~10 buttons
+        # on each 700ms refresh and unpolish/polish is a full stylesheet
+        # re-resolve per widget.
+        if widget.property("runtimeState") == runtime_state:
+            return
+        widget.setProperty("runtimeState", runtime_state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _runtime_state_for_status(self, key: str) -> tuple[str, str]:
+        state = self._status_state_values.get(key, "")
+        text = self._status_text_values.get(key, "")
+        if state == _StatusState.OK:
+            return "ok", text
+        if state == _StatusState.ERR:
+            return "err", text
+        if state == _StatusState.WAIT:
+            lowered = text.lower()
+            if any(token in lowered for token in ("idle", "not loaded", "not applied", "not found", "off")):
+                return "idle", text
+            return "wait", text
+        return "idle", text
+
+    def _tracking_runtime_state(self) -> tuple[str, str]:
+        tracking_state = self._status_state_values.get("tracking", "")
+        tracking_text = self._status_text_values.get("tracking", "")
+        if tracking_state == _StatusState.OK:
+            return "ok", tracking_text
+        if tracking_state == _StatusState.ERR:
+            return "err", tracking_text
+
+        for key in ("transforms", "launcher", "server"):
+            state = self._status_state_values.get(key, "")
+            text = self._status_text_values.get(key, "")
+            if state == _StatusState.ERR:
+                return "err", text
+            if state in (_StatusState.OK, _StatusState.WAIT):
+                lowered = text.lower()
+                if state == _StatusState.WAIT and any(token in lowered for token in ("idle", "not found", "not applied")):
+                    continue
+                return "wait", text or tracking_text
+
+        return "idle", tracking_text
+
+    def _navigation_runtime_state(self) -> tuple[str, str]:
+        if self._workflow_is_running():
+            return "active", "Navigation workflow is running"
+        tracking_state = self._status_state_values.get("tracking", "")
+        tracking_text = self._status_text_values.get("tracking", "")
+        if tracking_state == _StatusState.OK:
+            return "ok", tracking_text
+        if tracking_state == _StatusState.ERR:
+            return "err", tracking_text
+        return "idle", tracking_text
+
+    def _stop_runtime_state(self) -> tuple[str, str]:
+        if self._workflow_is_running() or self._busy_workflow_active or self._tracking_connected:
+            return "active", "Workflow can be stopped"
+        return "idle", ""
+
+    def _current_ct_volume_and_display(self):
+        ct_volume = self._find_best_scalar_volume_in_scene()
+        if ct_volume is None:
+            return None, None
+        display_node = None
+        try:
+            display_node = ct_volume.GetDisplayNode()
+        except Exception:
+            display_node = None
+        if display_node is None:
+            try:
+                ct_volume.CreateDefaultDisplayNodes()
+                display_node = ct_volume.GetDisplayNode()
+            except Exception:
+                display_node = None
+        return ct_volume, display_node
+
+    def _current_volume_rendering_display_node(self, volume_node):
+        if volume_node is None or not hasattr(slicer.modules, "volumerendering"):
+            return None
+
+        try:
+            vr_logic = slicer.modules.volumerendering.logic()
+            if vr_logic is not None:
+                display_node = vr_logic.GetFirstVolumeRenderingDisplayNode(volume_node)
+                if display_node is not None:
+                    return display_node
+        except Exception:
+            pass
+
+        try:
+            for display_index in range(volume_node.GetNumberOfDisplayNodes()):
+                display_node = volume_node.GetNthDisplayNode(display_index)
+                if display_node is not None and display_node.IsA("vtkMRMLVolumeRenderingDisplayNode"):
+                    return display_node
+        except Exception:
+            pass
+        return None
+
+    def _volume_property_from_vr_display_node(self, vr_display_node):
+        if vr_display_node is None:
+            return None, None
+
+        try:
+            property_node = vr_display_node.GetVolumePropertyNode()
+        except Exception:
+            property_node = None
+        if property_node is None:
+            return None, None
+
+        try:
+            volume_property = property_node.GetVolumeProperty()
+        except Exception:
+            volume_property = None
+        if volume_property is None:
+            return property_node, None
+        return property_node, volume_property
+
+    def _capture_vr_shift_baseline(self, volume_property):
+        self._vr_shift_baseline_opacity_points = []
+        self._vr_shift_baseline_color_points = []
+
+        opacity_function = None
+        try:
+            opacity_function = volume_property.GetScalarOpacity()
+        except Exception:
+            try:
+                opacity_function = volume_property.GetScalarOpacity(0)
+            except Exception:
+                opacity_function = None
+
+        if opacity_function is not None:
+            try:
+                node_count = int(opacity_function.GetSize())
+            except Exception:
+                node_count = 0
+            for index in range(max(0, node_count)):
+                values = [0.0, 0.0, 0.0, 0.0]
+                try:
+                    opacity_function.GetNodeValue(index, values)
+                except Exception:
+                    continue
+                self._vr_shift_baseline_opacity_points.append(
+                    (float(values[0]), float(values[1]), float(values[2]), float(values[3]))
+                )
+
+        color_function = None
+        try:
+            color_function = volume_property.GetRGBTransferFunction()
+        except Exception:
+            try:
+                color_function = volume_property.GetRGBTransferFunction(0)
+            except Exception:
+                color_function = None
+
+        if color_function is not None:
+            try:
+                node_count = int(color_function.GetSize())
+            except Exception:
+                node_count = 0
+            for index in range(max(0, node_count)):
+                values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                try:
+                    color_function.GetNodeValue(index, values)
+                except Exception:
+                    continue
+                self._vr_shift_baseline_color_points.append(
+                    (
+                        float(values[0]),
+                        float(values[1]),
+                        float(values[2]),
+                        float(values[3]),
+                        float(values[4]),
+                        float(values[5]),
+                    )
+                )
+
+    def _apply_vr_shift(self, volume_property, shift_value: float):
+        opacity_function = None
+        try:
+            opacity_function = volume_property.GetScalarOpacity()
+        except Exception:
+            try:
+                opacity_function = volume_property.GetScalarOpacity(0)
+            except Exception:
+                opacity_function = None
+
+        if opacity_function is not None and self._vr_shift_baseline_opacity_points:
+            try:
+                opacity_function.RemoveAllPoints()
+                for x_value, y_value, midpoint, sharpness in self._vr_shift_baseline_opacity_points:
+                    opacity_function.AddPoint(
+                        float(x_value) + float(shift_value),
+                        float(y_value),
+                        float(midpoint),
+                        float(sharpness),
+                    )
+            except Exception:
+                pass
+
+        color_function = None
+        try:
+            color_function = volume_property.GetRGBTransferFunction()
+        except Exception:
+            try:
+                color_function = volume_property.GetRGBTransferFunction(0)
+            except Exception:
+                color_function = None
+
+        if color_function is not None and self._vr_shift_baseline_color_points:
+            try:
+                color_function.RemoveAllPoints()
+                for x_value, red, green, blue, midpoint, sharpness in self._vr_shift_baseline_color_points:
+                    color_function.AddRGBPoint(
+                        float(x_value) + float(shift_value),
+                        float(red),
+                        float(green),
+                        float(blue),
+                        float(midpoint),
+                        float(sharpness),
+                    )
+            except Exception:
+                pass
+
+        try:
+            volume_property.Modified()
+        except Exception:
+            pass
+
+    def _sync_shift_control(self, ct_volume):
+        if self._shift_slider is None or self._shift_value_label is None:
+            return
+
+        if ct_volume is None:
+            self._vr_shift_property_node_id = ""
+            self._vr_shift_baseline_opacity_points = []
+            self._vr_shift_baseline_color_points = []
+            self._shift_slider_syncing = True
+            try:
+                self._shift_slider.setValue(0)
+                self._shift_slider.enabled = False
+                self._shift_value_label.text = "--"
+            finally:
+                self._shift_slider_syncing = False
+            return
+
+        vr_display_node = self._current_volume_rendering_display_node(ct_volume)
+        property_node, volume_property = self._volume_property_from_vr_display_node(vr_display_node)
+        if property_node is None or volume_property is None:
+            self._shift_slider.enabled = False
+            self._shift_value_label.text = "--"
+            return
+
+        property_node_id = str(property_node.GetID() or "")
+        if property_node_id != self._vr_shift_property_node_id:
+            self._vr_shift_property_node_id = property_node_id
+            self._capture_vr_shift_baseline(volume_property)
+            self._shift_slider_syncing = True
+            try:
+                self._shift_slider.setValue(0)
+            finally:
+                self._shift_slider_syncing = False
+        elif self._shift_slider.value == 0:
+            # Keep baseline current when no shift is applied.
+            self._capture_vr_shift_baseline(volume_property)
+
+        self._shift_slider.enabled = True
+        self._shift_value_label.text = str(int(self._shift_slider.value))
+
+    def _sync_window_level_controls(self):
+        if self._window_slider is None or self._level_slider is None or self._window_value_label is None or self._level_value_label is None:
+            return
+
+        ct_volume, display_node = self._current_ct_volume_and_display()
+        if ct_volume is None or display_node is None:
+            self._window_level_defaults_volume_id = ""
+            self._window_slider.enabled = False
+            self._level_slider.enabled = False
+            self._window_value_label.text = "--"
+            self._level_value_label.text = "--"
+            self._sync_shift_control(None)
+            return
+
+        scalar_min = -1024.0
+        scalar_max = 3071.0
+        try:
+            image_data = ct_volume.GetImageData()
+            if image_data is not None:
+                scalar_range = image_data.GetScalarRange()
+                scalar_min = float(scalar_range[0])
+                scalar_max = float(scalar_range[1])
+        except Exception:
+            pass
+
+        try:
+            window_value = int(round(float(display_node.GetWindow())))
+        except Exception:
+            window_value = _DEFAULT_WINDOW_VALUE
+        try:
+            level_value = int(round(float(display_node.GetLevel())))
+        except Exception:
+            level_value = _DEFAULT_LEVEL_VALUE
+
+        span = max(1, int(round(scalar_max - scalar_min)))
+        window_min = 1
+        window_max = max(500, span * 2)
+        level_min = int(round(scalar_min - (span * 0.5)))
+        level_max = int(round(scalar_max + (span * 0.5)))
+
+        window_max = max(window_max, window_value)
+        level_min = min(level_min, level_value)
+        level_max = max(level_max, level_value)
+
+        self._window_level_syncing = True
+        try:
+            self._window_slider.setMinimum(window_min)
+            self._window_slider.setMaximum(window_max)
+            self._window_slider.setValue(max(window_min, min(window_value, window_max)))
+            self._window_slider.enabled = True
+
+            self._level_slider.setMinimum(level_min)
+            self._level_slider.setMaximum(level_max)
+            self._level_slider.setValue(max(level_min, min(level_value, level_max)))
+            self._level_slider.enabled = True
+
+            self._window_value_label.text = str(self._window_slider.value)
+            self._level_value_label.text = str(self._level_slider.value)
+        finally:
+            self._window_level_syncing = False
+        self._sync_shift_control(ct_volume)
+
+    def _on_window_slider_changed(self, value: int):
+        if self._window_value_label is not None:
+            self._window_value_label.text = str(int(value))
+        if self._window_level_syncing:
+            return
+
+        _ct_volume, display_node = self._current_ct_volume_and_display()
+        if display_node is None:
+            return
+        try:
+            display_node.SetAutoWindowLevel(False)
+            display_node.SetWindow(float(value))
+            display_node.Modified()
+        except Exception:
+            pass
+
+    def _on_level_slider_changed(self, value: int):
+        if self._level_value_label is not None:
+            self._level_value_label.text = str(int(value))
+        if self._window_level_syncing:
+            return
+
+        _ct_volume, display_node = self._current_ct_volume_and_display()
+        if display_node is None:
+            return
+        try:
+            display_node.SetAutoWindowLevel(False)
+            display_node.SetLevel(float(value))
+            display_node.Modified()
+        except Exception:
+            pass
+
+    def _on_shift_slider_changed(self, value: int):
+        if self._shift_value_label is not None:
+            self._shift_value_label.text = str(int(value))
+        if self._shift_slider_syncing:
+            return
+        if self._shift_slider is None or not self._shift_slider.enabled:
+            return
+
+        ct_volume, _display_node = self._current_ct_volume_and_display()
+        vr_display_node = self._current_volume_rendering_display_node(ct_volume)
+        property_node, volume_property = self._volume_property_from_vr_display_node(vr_display_node)
+        if property_node is None or volume_property is None:
+            return
+
+        property_node_id = str(property_node.GetID() or "")
+        if property_node_id and property_node_id != self._vr_shift_property_node_id:
+            self._vr_shift_property_node_id = property_node_id
+            self._capture_vr_shift_baseline(volume_property)
+        elif not self._vr_shift_baseline_opacity_points and not self._vr_shift_baseline_color_points:
+            self._capture_vr_shift_baseline(volume_property)
+
+        self._apply_vr_shift(volume_property, float(value))
+        try:
+            property_node.Modified()
+            vr_display_node.Modified()
+        except Exception:
+            pass
+
+    def _apply_default_window_level_if_needed(self, force: bool = False):
+        ct_volume, display_node = self._current_ct_volume_and_display()
+        if ct_volume is None or display_node is None:
+            self._window_level_defaults_volume_id = ""
+            return
+
+        volume_id = str(ct_volume.GetID() or "")
+        if not force and volume_id and volume_id == self._window_level_defaults_volume_id:
+            return
+
+        try:
+            display_node.SetAutoWindowLevel(False)
+            display_node.SetWindow(float(_DEFAULT_WINDOW_VALUE))
+            display_node.SetLevel(float(_DEFAULT_LEVEL_VALUE))
+            display_node.Modified()
+        except Exception:
+            return
+
+        self._window_level_defaults_volume_id = volume_id
+        self._sync_window_level_controls()
+
+    def _sync_runtime_surface(self):
+        self._sync_window_level_controls()
+
+        launcher_state, launcher_text = self._runtime_state_for_status("launcher")
+        ct_state, ct_text = self._runtime_state_for_status("ct")
+        vr_state, vr_text = self._runtime_state_for_status("vr")
+        needle_state, needle_text = self._runtime_state_for_status("needle")
+        registration_state, registration_text = self._runtime_state_for_status("registration")
+        transforms_state, transforms_text = self._runtime_state_for_status("transforms")
+        tracking_state, tracking_text = self._tracking_runtime_state()
+        navigation_state, navigation_text = self._navigation_runtime_state()
+        stop_state, stop_text = self._stop_runtime_state()
+        workflow_running = self._workflow_is_running() or self._busy_workflow_active
+        stop_enabled = stop_state in ("active", "wait", "ok")
+
+        for widget in (self._load_ct_button,):
+            self._decorate_runtime_widget(widget, ct_state, ct_text)
+        for widget in (self._load_needle_button,):
+            self._decorate_runtime_widget(widget, needle_state, needle_text)
+        for widget in (self._load_registration_button, self._paste_registration_button):
+            self._decorate_runtime_widget(widget, registration_state, registration_text)
+        for widget in (self._initialize_tracking_button,):
+            self._decorate_runtime_widget(widget, tracking_state, tracking_text)
+        for widget in (self._open_reslicer_button,):
+            self._decorate_runtime_widget(widget, vr_state if vr_state != "idle" else transforms_state, vr_text or transforms_text)
+        for widget in (self._open_openigtlink_button,):
+            self._decorate_runtime_widget(
+                widget,
+                tracking_state if tracking_state != "idle" else launcher_state,
+                tracking_text or launcher_text,
+            )
+        for widget in (self._open_transforms_button,):
+            self._decorate_runtime_widget(widget, transforms_state, transforms_text)
+        for widget in (self._start_button, self._auto_start_button):
+            self._decorate_runtime_widget(widget, navigation_state, navigation_text)
+            if widget is not None:
+                widget.enabled = not workflow_running
+        for widget in (self._stop_button, self._auto_stop_button):
+            self._decorate_runtime_widget(widget, stop_state, stop_text)
+            if widget is not None:
+                widget.enabled = stop_enabled
+
+    def _current_path_value(self, path_widget: Optional[ctk.ctkPathLineEdit]) -> str:
+        if path_widget is None:
+            return ""
+        try:
+            return (path_widget.currentPath or "").strip()
+        except Exception:
+            return ""
+
+    def _line_edit_value(self, widget: Optional[qt.QLineEdit], default: str = "") -> str:
+        if widget is None:
+            return default
+        try:
+            return (widget.text or "").strip()
+        except Exception:
+            return default
+
+    def _normalized_reference_to_ct_name(self, value: str = "") -> str:
+        normalized = (value or "").strip()
+        if (not normalized) or (normalized in _LEGACY_REFERENCE_TO_CT_NAMES):
+            return _DEFAULT_REFERENCE_TO_CT_NAME
+        return normalized
+
+    def _normalized_pointer_to_ct_name(self, value: str = "") -> str:
+        normalized = (value or "").strip()
+        if (not normalized) or (normalized in _LEGACY_POINTER_TO_CT_NAMES):
+            return _DEFAULT_POINTER_TO_CT_NAME
+        return normalized
+
+    def _current_reference_to_ct_name(self) -> str:
+        return self._normalized_reference_to_ct_name(
+            self._line_edit_value(self._ct_transform_name, _DEFAULT_REFERENCE_TO_CT_NAME)
+        )
+
+    def _current_pointer_to_ct_name(self) -> str:
+        return self._normalized_pointer_to_ct_name(
+            self._line_edit_value(self._needle_transform_name, _DEFAULT_POINTER_TO_CT_NAME)
+        )
+
+    def _spin_box_value(self, widget: Optional[qt.QSpinBox], default: int) -> int:
+        if widget is None:
+            return default
+        try:
+            return int(widget.value)
+        except Exception:
+            return default
+
+    def _summarize_path(self, path: str, empty_text: str) -> tuple[str, str]:
+        normalized = (path or "").strip().rstrip("/\\")
+        if not normalized:
+            return empty_text, empty_text
+        return os.path.basename(normalized) or normalized, normalized
+
+    def _connector_is_connected(self, connector_node) -> bool:
+        try:
+            return (
+                connector_node is not None
+                and connector_node.GetState() == slicer.vtkMRMLIGTLConnectorNode.StateConnected
+            )
+        except Exception:
+            return False
+
+    def _find_plus_launcher_node(self):
+        workflow = self._current_workflow()
+        launcher_node = getattr(workflow, "_launcher_node", None) if workflow is not None else None
+        if self._node_is_live(launcher_node):
+            return launcher_node
+        return slicer.util.getFirstNodeByClassByName(
+            "vtkMRMLPlusServerLauncherNode", "SpineTracker2_PlusServerLauncher"
+        )
+
+    def _find_plus_server_node(self):
+        workflow = self._current_workflow()
+        server_node = getattr(workflow, "_server_node", None) if workflow is not None else None
+        if self._node_is_live(server_node):
+            return server_node
+        return slicer.util.getFirstNodeByClassByName("vtkMRMLPlusServerNode", "SpineTracker2_PlusServer")
+
+    def _find_igtl_connector_node(self):
+        workflow = self._current_workflow()
+        connector_node = getattr(workflow, "_igtl_connector_node", None) if workflow is not None else None
+        if self._node_is_live(connector_node):
+            return connector_node
+        return slicer.util.getFirstNodeByClassByName("vtkMRMLIGTLConnectorNode", "SpineTracker2_OpenIGTLink")
+
+    def _find_scene_needle_model(self, needle_transform=None):
+        workflow = self._current_workflow()
+        model_node = getattr(workflow, "_needle_model_node", None) if workflow is not None else None
+        if self._node_is_live(model_node):
+            return model_node
+
+        model_nodes = [node for node in slicer.util.getNodesByClass("vtkMRMLModelNode") if node is not None]
+        if needle_transform is not None:
+            transform_id = needle_transform.GetID()
+            for node in model_nodes:
+                try:
+                    if node.GetTransformNodeID() == transform_id:
+                        return node
+                except Exception:
+                    continue
+
+        needle_path = self._current_path_value(self._needle_stl_path)
+        expected_name = os.path.splitext(os.path.basename(needle_path))[0].strip().lower()
+        if expected_name:
+            for node in model_nodes:
+                try:
+                    if expected_name in (node.GetName() or "").strip().lower():
+                        return node
+                except Exception:
+                    continue
+        return None
+
+    def _scene_volume_rendering_visible(self, volume_node) -> bool:
+        workflow = self._current_workflow()
+        vr_display_node = getattr(workflow, "_vr_display_node", None) if workflow is not None else None
+        if self._node_is_live(vr_display_node):
+            try:
+                return bool(vr_display_node.GetVisibility())
+            except Exception:
+                pass
+
+        if volume_node is None or not hasattr(slicer.modules, "volumerendering"):
+            return False
+
+        try:
+            vr_logic = slicer.modules.volumerendering.logic()
+            if vr_logic is not None:
+                vr_display_node = vr_logic.GetFirstVolumeRenderingDisplayNode(volume_node)
+                if vr_display_node is not None:
+                    return bool(vr_display_node.GetVisibility())
+        except Exception:
+            pass
+
+        try:
+            for display_index in range(volume_node.GetNumberOfDisplayNodes()):
+                display_node = volume_node.GetNthDisplayNode(display_index)
+                if display_node is not None and display_node.IsA("vtkMRMLVolumeRenderingDisplayNode"):
+                    return bool(display_node.GetVisibility())
+        except Exception:
+            pass
+        return False
+
+    def _transform_matrix_list(self, transform_node) -> list[float]:
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToParent(matrix)
+        return [matrix.GetElement(row, column) for row in range(4) for column in range(4)]
+
+    def _transform_has_non_identity(self, transform_node) -> bool:
+        if transform_node is None:
+            return False
+        try:
+            values = self._transform_matrix_list(transform_node)
+        except Exception:
+            return False
+
+        for row in range(4):
+            for column in range(4):
+                expected = 1.0 if row == column else 0.0
+                if abs(values[row * 4 + column] - expected) > 1e-6:
+                    return True
+        return False
+
+    def _preserve_inflight_status(self, key: str, default_text: str) -> tuple[str, str]:
+        current_state = self._status_state_values.get(key, "")
+        current_text = self._status_text_values.get(key, "") or default_text
+        if current_state == _StatusState.ERR:
+            return current_state, current_text
+        if current_state == _StatusState.WAIT:
+            lowered = current_text.lower()
+            if not any(token in lowered for token in ("idle", "not loaded", "not applied", "not found", "off")):
+                return current_state, current_text
+        return _StatusState.WAIT, default_text
+
+    def _collect_runtime_snapshot(self) -> dict[str, object]:
+        workflow = self._current_workflow()
+        ct_transform_name = self._current_reference_to_ct_name()
+        needle_transform_name = self._current_pointer_to_ct_name()
+
+        ct_volume = self._find_best_scalar_volume_in_scene()
+        ct_transform = self._find_transform_node(ct_transform_name)
+        needle_transform = self._find_transform_node(needle_transform_name)
+        needle_model = self._find_scene_needle_model(needle_transform)
+
+        launcher_node = self._find_plus_launcher_node()
+        launcher_connector = launcher_node.GetConnectorNode() if launcher_node is not None else None
+        launcher_connected = self._connector_is_connected(launcher_connector)
+
+        server_node = self._find_plus_server_node()
+        server_state = int(server_node.GetState()) if server_node is not None else 0
+        server_desired_state = int(server_node.GetDesiredState()) if server_node is not None else 0
+        server_state_name = {0: "Off", 1: "On", 2: "Starting", 3: "Stopping"}.get(server_state, str(server_state))
+        server_on = server_node is not None and server_state == 1 and server_desired_state == 1
+
+        igtl_connector = self._find_igtl_connector_node()
+        igtl_connected = self._connector_is_connected(igtl_connector)
+
+        registration_loaded = bool(getattr(workflow, "_registration_loaded", False)) if workflow is not None else False
+        registration_source = str(getattr(workflow, "_registration_loaded_from", "") or "").strip() if workflow else ""
+
+        if registration_loaded and not registration_source:
+            current_registration = self._status_text_values.get("registration", "")
+            if ":" in current_registration:
+                registration_source = current_registration.split(":", 1)[1].strip()
+
+        workflow_tracking_active = bool(getattr(workflow, "_tracking_active", False)) if workflow is not None else False
+
+        if needle_transform is None:
+            self._runtime_motion_seen = False
+            self._last_runtime_needle_transform_id = ""
+            self._last_runtime_needle_matrix = None
+            tracking_active = False
+        else:
+            transform_id = needle_transform.GetID() or ""
+            current_matrix = self._transform_matrix_list(needle_transform)
+            if transform_id != self._last_runtime_needle_transform_id:
+                self._last_runtime_needle_transform_id = transform_id
+                self._last_runtime_needle_matrix = current_matrix
+                self._runtime_motion_seen = False
+            else:
+                if self._last_runtime_needle_matrix is not None:
+                    moved = any(
+                        abs(current_matrix[index] - self._last_runtime_needle_matrix[index]) > 1e-6
+                        for index in range(16)
+                    )
+                    if moved:
+                        self._runtime_motion_seen = True
+                        self._last_runtime_motion_at = time.time()
+                self._last_runtime_needle_matrix = current_matrix
+
+            if workflow_tracking_active:
+                self._runtime_motion_seen = True
+                self._last_runtime_motion_at = time.time()
+            # Motion must be recent: a connector can stay in StateConnected
+            # while the pose stream is frozen (camera occluded, acquisition
+            # stalled) — that must not read as live tracking.
+            motion_recent = (
+                self._runtime_motion_seen
+                and (time.time() - self._last_runtime_motion_at) < 5.0
+            )
+            tracking_active = workflow_tracking_active or (
+                motion_recent and (igtl_connected or self._workflow_is_running())
+            )
+
+        if ct_transform is not None:
+            registration_loaded = registration_loaded or self._transform_has_non_identity(ct_transform)
+
+        selection = None
+        if workflow is not None and hasattr(workflow, "_resolve_tracking_input_selection"):
+            try:
+                selection = workflow._resolve_tracking_input_selection()
+            except Exception:
+                selection = None
+
+        pointer_input = None
+        reference_input = None
+        pointer_input_ready = False
+        tracking_input_mode = ""
+        if selection is not None:
+            if selection.pointer_to_reference_node is not None:
+                pointer_input = selection.pointer_to_reference_node
+                pointer_input_ready = True
+                tracking_input_mode = "direct"
+            elif selection.reference_to_pointer_node is not None:
+                pointer_input = selection.reference_to_pointer_node
+                pointer_input_ready = True
+                tracking_input_mode = "inverse"
+            elif selection.pointer_to_tracker_node is not None and selection.reference_to_tracker_node is not None:
+                pointer_input = selection.pointer_to_tracker_node
+                pointer_input_ready = True
+                tracking_input_mode = "tracker-chain"
+            reference_input = selection.reference_to_tracker_node
+
+        return {
+            "workflow": workflow,
+            "workflow_running": self._workflow_is_running(),
+            "launcher_connected": launcher_connected,
+            "launcher_present": launcher_node is not None,
+            "server_on": server_on,
+            "server_present": server_node is not None,
+            "server_state_name": server_state_name,
+            "ct_volume": ct_volume,
+            "vr_visible": self._scene_volume_rendering_visible(ct_volume),
+            "ct_transform": ct_transform,
+            "needle_transform": needle_transform,
+            "pointer_input": pointer_input,
+            "pointer_input_ready": pointer_input_ready,
+            "reference_input": reference_input,
+            "reference_frame_name": selection.reference_frame_name if selection is not None else "",
+            "tracking_input_mode": tracking_input_mode,
+            "needle_model": needle_model,
+            "igtl_connected": igtl_connected,
+            "registration_loaded": registration_loaded,
+            "registration_source": registration_source,
+            "tracking_active": tracking_active,
+        }
+
+    def _launcher_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        if snapshot["launcher_connected"]:
+            return _StatusState.OK, "Launcher connected"
+        if snapshot["launcher_present"] or snapshot["workflow_running"]:
+            return self._preserve_inflight_status("launcher", "Launcher: waiting")
+        return self._preserve_inflight_status("launcher", "Launcher: idle")
+
+    def _server_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        if snapshot["server_on"]:
+            return _StatusState.OK, "Server started"
+        if snapshot["server_present"]:
+            state_name = str(snapshot["server_state_name"] or "Off")
+            if state_name.lower() != "off":
+                return _StatusState.WAIT, f"Server: {state_name}"
+        return self._preserve_inflight_status("server", "Server: idle")
+
+    def _registration_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        if snapshot["registration_loaded"]:
+            registration_source = str(snapshot["registration_source"] or "").strip()
+            if registration_source:
+                return _StatusState.OK, f"Registration applied: {registration_source}"
+            current_text = self._status_text_values.get("registration", "")
+            # Never pair the OK state with a stale negative text: when loaded
+            # was inferred from a non-identity ReferenceToCT (e.g. the matrix
+            # arrived via the stream), the stored text can still be the
+            # initial "Registration: not applied".
+            if current_text and "not applied" not in current_text.lower():
+                return _StatusState.OK, current_text
+            return _StatusState.OK, "Registration applied"
+        return self._preserve_inflight_status("registration", "Registration: not applied")
+
+    def _transforms_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        ct_transform = snapshot["ct_transform"]
+        needle_transform = snapshot["needle_transform"]
+        pointer_input_ready = bool(snapshot["pointer_input_ready"])
+        reference_input = snapshot["reference_input"]
+        reference_frame_name = str(snapshot.get("reference_frame_name") or "").strip()
+        tracking_input_mode = str(snapshot.get("tracking_input_mode") or "").strip()
+        if ct_transform is not None and needle_transform is not None and pointer_input_ready:
+            if reference_frame_name:
+                if tracking_input_mode == "tracker-chain":
+                    return _StatusState.OK, f"Tracking pipeline ready ({reference_frame_name} via tracker)"
+                return _StatusState.OK, f"Tracking pipeline ready ({reference_frame_name} frame)"
+            return _StatusState.OK, "Tracking pipeline ready"
+
+        missing = []
+        if ct_transform is None:
+            missing.append(self._current_reference_to_ct_name())
+        if needle_transform is None:
+            missing.append(self._current_pointer_to_ct_name())
+        if not pointer_input_ready:
+            if reference_frame_name:
+                missing.extend(
+                    [
+                        f"PointerTo{reference_frame_name}",
+                        f"{reference_frame_name}ToPointer",
+                        _LIVE_POINTER_TO_TRACKER_NAME,
+                    ]
+                )
+                if reference_input is None:
+                    missing.append(f"{reference_frame_name}ToTracker")
+            else:
+                missing.extend(
+                    [
+                        _LIVE_POINTER_TO_TRACKER_NAME,
+                        _LIVE_REFERENCE_TO_TRACKER_NAME,
+                        "PointerToPhantom",
+                        "PhantomToPointer",
+                        "PhantomToTracker",
+                    ]
+                )
+
+        if missing:
+            current_state, current_text = self._preserve_inflight_status("transforms", "Transforms: not found")
+            if current_state == _StatusState.WAIT and current_text == "Transforms: not found":
+                unique_missing = []
+                for name in missing:
+                    if name not in unique_missing:
+                        unique_missing.append(name)
+                return _StatusState.WAIT, "Waiting: " + ", ".join(unique_missing)
+            return current_state, current_text
+        return self._preserve_inflight_status("transforms", "Transforms: not found")
+
+    def _tracking_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        if snapshot["tracking_active"]:
+            return _StatusState.OK, "Tracking active"
+        if (
+            snapshot["igtl_connected"]
+            and snapshot["needle_transform"] is not None
+            and snapshot["pointer_input_ready"]
+        ):
+            return _StatusState.WAIT, "Tracking ready"
+        if snapshot["igtl_connected"]:
+            return _StatusState.WAIT, "OpenIGTLink connected"
+        return self._preserve_inflight_status("tracking", "Tracking: idle")
+
+    def _ct_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        ct_volume = snapshot["ct_volume"]
+        if ct_volume is not None:
+            return _StatusState.OK, f"CT loaded: {ct_volume.GetName()}"
+        return self._preserve_inflight_status("ct", "CT: not loaded")
+
+    def _vr_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        if snapshot["vr_visible"]:
+            return _StatusState.OK, "Volume rendering enabled"
+        if snapshot["ct_volume"] is not None:
+            return _StatusState.WAIT, "Volume rendering: off"
+        return self._preserve_inflight_status("vr", "Volume rendering: off")
+
+    def _needle_status_from_snapshot(self, snapshot: dict[str, object]) -> tuple[str, str]:
+        needle_model = snapshot["needle_model"]
+        if needle_model is not None:
+            return _StatusState.OK, f"Needle loaded: {needle_model.GetName()}"
+        return self._preserve_inflight_status("needle", "Needle: not loaded")
+
+    def _extract_rms_value(self, text: str) -> Optional[float]:
+        value_match = re.search(
+            r"(?:RMSE|RMS(?:\s*Error)?)\s*[:=]\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+            text or "",
+            re.IGNORECASE,
+        )
+        if not value_match:
+            return None
+        try:
+            return float(value_match.group(1))
+        except Exception:
+            return None
+
+    def _registration_rmse_from_scene(self, snapshot: dict[str, object]) -> Optional[float]:
+        current_status_text = str(self._status_text_values.get("registration", "") or "")
+        from_status = self._extract_rms_value(current_status_text)
+        if from_status is not None:
+            return from_status
+
+        transform_node = snapshot.get("ct_transform")
+        if transform_node is None:
+            return None
+
+        try:
+            explicit_rmse = str(transform_node.GetAttribute(_REGISTRATION_RMSE_ATTRIBUTE) or "").strip()
+            if explicit_rmse:
+                return float(explicit_rmse)
+        except Exception:
+            pass
+
+        try:
+            attr_names = vtk.vtkStringArray()
+            transform_node.GetAttributeNames(attr_names)
+            for index in range(attr_names.GetNumberOfValues()):
+                attr_name = str(attr_names.GetValue(index) or "")
+                if "rms" not in attr_name.lower():
+                    continue
+                attr_value = str(transform_node.GetAttribute(attr_name) or "").strip()
+                try:
+                    return float(attr_value)
+                except Exception:
+                    parsed = self._extract_rms_value(attr_value)
+                    if parsed is not None:
+                        return parsed
+        except Exception:
+            pass
+        return None
+
+    def _registration_accuracy_text_from_scene(self, snapshot: dict[str, object]) -> str:
+        registration_rmse = self._registration_rmse_from_scene(snapshot)
+        if registration_rmse is not None:
+            return f"Registration Accuracy: RMSE {registration_rmse:.2f} mm"
+
+        if not bool(snapshot.get("registration_loaded")):
+            return "Registration Accuracy: --"
+
+        transform_node = snapshot.get("ct_transform")
+        method = ""
+        source = ""
+        if transform_node is not None:
+            try:
+                method = str(transform_node.GetAttribute(_REGISTRATION_METHOD_ATTRIBUTE) or "").strip()
+            except Exception:
+                method = ""
+            try:
+                source = str(transform_node.GetAttribute(_REGISTRATION_SOURCE_ATTRIBUTE) or "").strip()
+            except Exception:
+                source = ""
+
+        if not source:
+            source = str(snapshot.get("registration_source") or "").strip()
+
+        if method in ("matrix-file", "matrix-text") or source:
+            if source.lower() == "pasted":
+                source = "pasted matrix"
+            suffix = f" ({source})" if source else ""
+            return f"Registration Accuracy: Matrix-based transform{suffix}"
+
+        return "Registration Accuracy: Transform loaded"
+
+    def _tool_jitter_rms_from_snapshot(self, snapshot: dict[str, object]) -> tuple[Optional[float], int]:
+        transform_node = snapshot.get("needle_transform")
+        if transform_node is None:
+            self._tracking_accuracy_samples = []
+            return None, 0
+
+        matrix = vtk.vtkMatrix4x4()
+        transform_node.GetMatrixTransformToParent(matrix)
+        point = (
+            float(matrix.GetElement(0, 3)),
+            float(matrix.GetElement(1, 3)),
+            float(matrix.GetElement(2, 3)),
+        )
+        now = time.time()
+        self._tracking_accuracy_samples.append((now, point))
+
+        cutoff = now - self._tracking_accuracy_window_seconds
+        while self._tracking_accuracy_samples and self._tracking_accuracy_samples[0][0] < cutoff:
+            self._tracking_accuracy_samples.pop(0)
+
+        sample_count = len(self._tracking_accuracy_samples)
+        if sample_count < 2:
+            return None, sample_count
+
+        squared_steps: list[float] = []
+        for index in range(1, sample_count):
+            prev = self._tracking_accuracy_samples[index - 1][1]
+            cur = self._tracking_accuracy_samples[index][1]
+            dx = cur[0] - prev[0]
+            dy = cur[1] - prev[1]
+            dz = cur[2] - prev[2]
+            squared_steps.append(dx * dx + dy * dy + dz * dz)
+
+        if not squared_steps:
+            return None, sample_count
+        rms_mm = (sum(squared_steps) / len(squared_steps)) ** 0.5
+        return float(rms_mm), sample_count
+
+    def _update_tracking_accuracy_panel(self, snapshot: dict[str, object]):
+        if (
+            self._registration_rmse_label is None
+            and self._tool_jitter_rmse_label is None
+            and self._tracking_rate_label is None
+        ):
+            return
+
+        if self._registration_rmse_label is not None:
+            self._registration_rmse_label.text = self._registration_accuracy_text_from_scene(snapshot)
+
+        if self._tool_jitter_rmse_label is not None:
+            tool_jitter_rms, sample_count = self._tool_jitter_rms_from_snapshot(snapshot)
+            if tool_jitter_rms is None:
+                self._tool_jitter_rmse_label.text = "Tool jitter RMS: --"
+            else:
+                self._tool_jitter_rmse_label.text = f"Tool jitter RMS: {tool_jitter_rms:.3f} mm ({sample_count} samples)"
+
+        self._ensure_rate_monitor(snapshot)
+        self._update_tracking_rate_label(snapshot)
+
+    # -------------------------------------------------------------------
+    # Live update-rate (FPS) / latency readout
+    # -------------------------------------------------------------------
+
+    def _ensure_rate_monitor(self, snapshot: dict[str, object]):
+        """Observe the live stream node so its update rate can be measured.
+
+        Prefers the raw incoming pointer stream (modified once per tracker
+        frame) and falls back to the displayed PointerToCT pose. Re-wires and
+        resets the stats whenever the source node changes (new stream / restart).
+        """
+        if self._tracking_rate_label is None:
+            return
+        node = snapshot.get("pointer_input") or snapshot.get("needle_transform")
+        if node is self._rate_monitor_node:
+            return
+        self._detach_rate_monitor()
+        self._rate_monitor_node = node
+        if node is not None:
+            try:
+                self._rate_monitor_observer_tag = node.AddObserver(
+                    vtk.vtkCommand.ModifiedEvent, self._on_rate_monitor_modified
+                )
+            except Exception:
+                self._rate_monitor_observer_tag = None
+
+    def _detach_rate_monitor(self):
+        if self._rate_monitor_node is not None and self._rate_monitor_observer_tag is not None:
+            try:
+                self._rate_monitor_node.RemoveObserver(self._rate_monitor_observer_tag)
+            except Exception:
+                pass
+        self._rate_monitor_node = None
+        self._rate_monitor_observer_tag = None
+        self._rate_samples = []
+
+    def _on_rate_monitor_modified(self, caller=None, event=None):
+        # Fires once per incoming tracker frame (this is the fps-driven path).
+        now = time.perf_counter()
+        latency_ms = self._read_stream_latency_ms(caller if caller is not None else self._rate_monitor_node)
+        self._rate_samples.append((now, latency_ms))
+        cutoff = now - self._rate_window_seconds
+        while self._rate_samples and self._rate_samples[0][0] < cutoff:
+            self._rate_samples.pop(0)
+
+    def _read_stream_latency_ms(self, node) -> Optional[float]:
+        """Best-effort age (ms) of the latest frame from the tracker's timestamp.
+
+        Returns None when the stream carries no usable acquisition timestamp; in
+        that case only FPS/interval are meaningful and true end-to-end latency
+        must be measured with the high-speed-video method.
+        """
+        if node is None:
+            return None
+        for attr in ("IGTLTimeStamp", "timestamp", "TimeStamp"):
+            try:
+                raw = node.GetAttribute(attr)
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                ts = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0.0:
+                continue
+            if ts > 1e12:  # milliseconds since epoch -> seconds
+                ts /= 1000.0
+            age_ms = (time.time() - ts) * 1000.0
+            if -1000.0 < age_ms < 60000.0:  # reject clock-skew garbage
+                return age_ms
+        return None
+
+    def _rate_stats(self):
+        """Return (fps, mean_interval_ms, jitter_ms, latency_ms, sample_count)."""
+        now = time.perf_counter()
+        cutoff = now - self._rate_window_seconds
+        samples = [s for s in self._rate_samples if s[0] >= cutoff]
+        count = len(samples)
+        if count < 2:
+            return None, None, None, None, count
+        times = [s[0] for s in samples]
+        span = times[-1] - times[0]
+        fps = (count - 1) / span if span > 0 else None
+        intervals = [(times[i] - times[i - 1]) * 1000.0 for i in range(1, count)]
+        mean_iv = sum(intervals) / len(intervals)
+        jitter = (sum((iv - mean_iv) ** 2 for iv in intervals) / len(intervals)) ** 0.5
+        latencies = [s[1] for s in samples if s[1] is not None]
+        latency = sum(latencies) / len(latencies) if latencies else None
+        return fps, mean_iv, jitter, latency, count
+
+    def _update_tracking_rate_label(self, snapshot: dict[str, object]):
+        if self._tracking_rate_label is None:
+            return
+        fps, mean_iv, jitter, latency, count = self._rate_stats()
+        if fps is None:
+            if snapshot.get("tracking_active") or self._rate_monitor_node is not None:
+                self._tracking_rate_label.text = "Update rate: waiting for stream…"
+            else:
+                self._tracking_rate_label.text = "Update rate: --"
+            return
+        text = f"Update rate: {fps:.1f} fps  ({mean_iv:.1f} ± {jitter:.1f} ms, n={count})"
+        if latency is not None:
+            text += f"  ·  latency {latency:.0f} ms"
+        self._tracking_rate_label.text = text
+
+    def _refresh_runtime_from_scene(self):
+        if not hasattr(self, "logic") or self.logic is None:
+            return
+
+        snapshot = self._collect_runtime_snapshot()
+        updates = (
+            ("launcher",) + self._launcher_status_from_snapshot(snapshot),
+            ("server",) + self._server_status_from_snapshot(snapshot),
+            ("ct",) + self._ct_status_from_snapshot(snapshot),
+            ("registration",) + self._registration_status_from_snapshot(snapshot),
+            ("vr",) + self._vr_status_from_snapshot(snapshot),
+            ("needle",) + self._needle_status_from_snapshot(snapshot),
+            ("transforms",) + self._transforms_status_from_snapshot(snapshot),
+            ("tracking",) + self._tracking_status_from_snapshot(snapshot),
+        )
+
+        for key, state, text in updates:
+            self._set_status(key, state, text, sync_surface=False)
+
+        self._tracking_connected = bool(
+            snapshot["igtl_connected"]
+            or snapshot["tracking_active"]
+            or snapshot["launcher_connected"]
+            or snapshot["server_on"]
+        )
+        self._refresh_session_summary(snapshot)
+        self._update_tracking_accuracy_panel(snapshot)
+        self._sync_runtime_surface()
+
+    def _set_summary_row_state(self, key: str, summary_state: str):
+        # Restyle only on an actual state change — this runs for every row on
+        # each 700ms refresh and unpolish/polish is a full stylesheet
+        # re-resolve per widget.
+        row = self._session_rows.get(key)
+        if row is not None and row.property("summaryState") != summary_state:
+            row.setProperty("summaryState", summary_state)
+            row.style().unpolish(row)
+            row.style().polish(row)
+            row.update()
+
+        label = self._session_value_labels.get(key)
+        if label is not None and label.property("summaryState") != summary_state:
+            label.setProperty("summaryState", summary_state)
+            label.style().unpolish(label)
+            label.style().polish(label)
+            label.update()
+
+    def _refresh_session_summary(self, snapshot: Optional[dict[str, object]] = None):
+        if not self._session_value_labels:
+            return
+
+        if snapshot is None:
+            snapshot = self._collect_runtime_snapshot()
+
+        study_text, study_tooltip = self._summarize_path(
+            self._current_path_value(self._dicom_folder_path),
+            "Configure DICOM folder in Workspace Settings",
+        )
+        needle_text, needle_tooltip = self._summarize_path(
+            self._current_path_value(self._needle_stl_path),
+            "Configure STL path in Workspace Settings",
+        )
+        registration_text, registration_tooltip = self._summarize_path(
+            self._current_path_value(self._registration_matrix_path),
+            "Choose a matrix file or use Paste Matrix",
+        )
+
+        plus_path = self._current_path_value(self._plus_config_path)
+        plus_text, plus_tooltip = self._summarize_path(plus_path, "")
+        launcher_host = self._line_edit_value(self._launcher_host, "localhost") or "localhost"
+        launcher_port = self._spin_box_value(self._launcher_port, 18904)
+        igtl_host = self._line_edit_value(self._igtl_host, "localhost") or "localhost"
+        igtl_port = self._spin_box_value(self._igtl_port, 18944)
+
+        stream_parts = []
+        if plus_text:
+            stream_parts.append(plus_text)
+        stream_parts.append(f"Launcher {launcher_host}:{launcher_port}")
+        stream_parts.append(f"IGTL {igtl_host}:{igtl_port}")
+        stream_text = " | ".join(stream_parts)
+        stream_tooltip = stream_text if not plus_path else f"{plus_tooltip}\nLauncher: {launcher_host}:{launcher_port}\nIGTL: {igtl_host}:{igtl_port}"
+
+        ct_volume = snapshot.get("ct_volume")
+        needle_model = snapshot.get("needle_model")
+        registration_loaded = bool(snapshot.get("registration_loaded"))
+        registration_source = str(snapshot.get("registration_source") or "").strip()
+        tracking_active = bool(snapshot.get("tracking_active"))
+        igtl_connected = bool(snapshot.get("igtl_connected"))
+        launcher_connected = bool(snapshot.get("launcher_connected"))
+        server_on = bool(snapshot.get("server_on"))
+
+        if ct_volume is not None:
+            study_text = f"Loaded: {ct_volume.GetName()}"
+            study_tooltip = f"{study_tooltip}\nLoaded node: {ct_volume.GetName()}".strip()
+        elif study_text != "Configure DICOM folder in Workspace Settings":
+            study_text = f"Ready: {study_text}"
+
+        if needle_model is not None:
+            needle_text = f"Loaded: {needle_model.GetName()}"
+            needle_tooltip = f"{needle_tooltip}\nLoaded node: {needle_model.GetName()}".strip()
+        elif needle_text != "Configure STL path in Workspace Settings":
+            needle_text = f"Ready: {needle_text}"
+
+        if registration_loaded:
+            registration_suffix = registration_source or self._status_text_values.get("registration", "").replace(
+                "Registration applied:", ""
+            ).strip()
+            registration_text = "Applied" if not registration_suffix else f"Applied: {registration_suffix}"
+            registration_tooltip = registration_text
+        elif registration_text != "Choose a matrix file or use Paste Matrix":
+            registration_text = f"Ready: {registration_text}"
+
+        if tracking_active:
+            stream_text = "Tracking active"
+            stream_tooltip = "OpenIGTLink transform stream is updating live."
+        elif igtl_connected:
+            stream_text = "OpenIGTLink connected"
+            stream_tooltip = f"Client connected to {igtl_host}:{igtl_port}"
+        elif launcher_connected and server_on:
+            stream_text = "PLUS ready"
+            stream_tooltip = "PLUS launcher and server are available."
+
+        state_by_row = {
+            "study": self._runtime_state_for_status("ct")[0],
+            "needle": self._runtime_state_for_status("needle")[0],
+            "registration": self._runtime_state_for_status("registration")[0],
+            "stream": (
+                "ok"
+                if tracking_active
+                else "wait"
+                if igtl_connected or launcher_connected or server_on
+                else "idle"
+            ),
+        }
+
+        for key, value_text, tooltip in (
+            ("study", study_text, study_tooltip),
+            ("needle", needle_text, needle_tooltip),
+            ("registration", registration_text, registration_tooltip),
+            ("stream", stream_text, stream_tooltip),
+        ):
+            label = self._session_value_labels.get(key)
+            if label is None:
+                continue
+            if label.text != value_text:
+                label.text = value_text
+            if (label.toolTip or "") != tooltip:
+                label.setToolTip(tooltip)
+            self._set_summary_row_state(key, state_by_row.get(key, "idle"))
+
+    def _scroll_home_to_top(self):
+        if self._scroll_area is None:
+            return
+        try:
+            self._scroll_area.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def _busy_push(self):
+        self._busy_count += 1
+        if self._busy_indicator is not None:
+            self._busy_indicator.visible = True
+        try:
+            slicer.app.processEvents()
+        except Exception:
+            pass
+
+    def _busy_pop(self):
+        if self._busy_count > 0:
+            self._busy_count -= 1
+        if self._busy_count <= 0:
+            self._busy_count = 0
+            if self._busy_indicator is not None:
+                self._busy_indicator.visible = False
+        try:
+            slicer.app.processEvents()
+        except Exception:
+            pass
+
+    def _busy_clear(self):
+        self._busy_count = 0
+        if self._busy_indicator is not None:
+            self._busy_indicator.visible = False
+        try:
+            slicer.app.processEvents()
+        except Exception:
+            pass
+
+    def _ensure_operation_progress_dialog(self):
+        if (
+            self._operation_progress_dialog is not None
+            and self._operation_progress_label is not None
+            and self._operation_progress_bar is not None
+        ):
+            return
+
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.objectName = "OperationProgressDialog"
+        dialog.windowTitle = "Progress"
+        dialog.setModal(True)
+        dialog.setWindowModality(qt.Qt.ApplicationModal)
+        dialog.setMinimumWidth(420)
+
+        layout = qt.QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = qt.QLabel("Working...")
+        title.objectName = "OperationProgressTitle"
+        layout.addWidget(title)
+
+        bar = qt.QProgressBar()
+        bar.objectName = "OperationProgressBar"
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(True)
+        layout.addWidget(bar)
+
+        self._operation_progress_dialog = dialog
+        self._operation_progress_label = title
+        self._operation_progress_bar = bar
+
+    def _begin_operation_progress(self, operation: str, label_text: str):
+        self._ensure_operation_progress_dialog()
+        self._active_progress_operation = operation
+        self._active_progress_failed = False
+
+        if self._operation_progress_label is not None:
+            self._operation_progress_label.text = label_text
+        if self._operation_progress_bar is not None:
+            self._operation_progress_bar.setValue(0)
+
+        if self._operation_progress_dialog is not None:
+            self._operation_progress_dialog.show()
+            self._operation_progress_dialog.raise_()
+            self._operation_progress_dialog.activateWindow()
+        self._update_operation_progress(5, "Starting...")
+
+    def _update_operation_progress(self, percent: int, label_text: str = ""):
+        if self._operation_progress_dialog is None:
+            return
+        clamped = max(0, min(100, int(percent)))
+        if self._operation_progress_bar is not None:
+            self._operation_progress_bar.setValue(clamped)
+        if label_text and self._operation_progress_label is not None:
+            self._operation_progress_label.text = label_text
+        try:
+            slicer.app.processEvents()
+        except Exception:
+            pass
+
+    def _finish_operation_progress(self):
+        if self._operation_progress_dialog is not None:
+            self._operation_progress_dialog.hide()
+        self._active_progress_operation = ""
+        try:
+            slicer.app.processEvents()
+        except Exception:
+            pass
+
+    def _progress_percent_for_status(self, operation: str, key: str, state: str) -> Optional[int]:
+        if operation == "load_ct":
+            if key == "ct" and state == _StatusState.WAIT:
+                return 25
+            if key == "ct" and state == _StatusState.OK:
+                return 60
+            if key == "vr" and state == _StatusState.WAIT:
+                return 80
+            if key == "vr" and state == _StatusState.OK:
+                return 100
+            return None
+
+        if operation == "load_stl":
+            if key == "needle" and state == _StatusState.WAIT:
+                return 35
+            if key == "needle" and state == _StatusState.OK:
+                return 100
+            return None
+
+        if operation in ("load_registration", "paste_registration"):
+            if key == "registration" and state == _StatusState.WAIT:
+                return 35
+            if key == "registration" and state == _StatusState.OK:
+                return 100
+            return None
+
+        return None
+
+    def _load_settings_into_ui(self):
+        settings = qt.QSettings()
+
+        def svalue(name: str, default=None):
+            return settings.value(_SETTINGS_PREFIX + name, default)
+
+        def sbool(name: str, default: bool) -> bool:
+            value = svalue(name, default)
+            if value is None:
+                return default
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+
+        self._suspend_settings_updates = True
+        try:
+            if self._dicom_folder_path is not None:
+                self._dicom_folder_path.currentPath = svalue("DicomFolder", "") or ""
+            if self._needle_stl_path is not None:
+                self._needle_stl_path.currentPath = svalue("NeedleStlPath", "") or ""
+            if self._registration_matrix_path is not None:
+                self._registration_matrix_path.currentPath = svalue("RegistrationMatrixPath", "") or ""
+            if self._plus_config_path is not None:
+                self._plus_config_path.currentPath = svalue("PlusConfigPath", "") or ""
+            if self._phantom_geometry_path is not None:
+                self._phantom_geometry_path.currentPath = svalue("PhantomGeometryPath", "") or ""
+            if self._tool_geometry_path is not None:
+                self._tool_geometry_path.currentPath = svalue("ToolGeometryPath", "") or ""
+            if self._plus_exe_path is not None:
+                saved_plus = svalue("PlusExePath", "") or ""
+                if not saved_plus:
+                    saved_plus = SpineTrackerWorkflow.find_bundled_plus_server()
+                self._plus_exe_path.currentPath = saved_plus
+
+            if self._launcher_host is not None:
+                self._launcher_host.text = svalue("PlusLauncherHost", "localhost") or "localhost"
+            if self._launcher_port is not None:
+                try:
+                    self._launcher_port.value = int(svalue("PlusLauncherPort", 18904) or 18904)
+                except Exception:
+                    self._launcher_port.value = 18904
+
+            if self._igtl_host is not None:
+                self._igtl_host.text = svalue("IgtlHost", "localhost") or "localhost"
+            if self._igtl_port is not None:
+                try:
+                    self._igtl_port.value = int(svalue("IgtlPort", 18944) or 18944)
+                except Exception:
+                    self._igtl_port.value = 18944
+
+            if self._ct_transform_name is not None:
+                current_ct = svalue("CtTransformName", _DEFAULT_REFERENCE_TO_CT_NAME) or _DEFAULT_REFERENCE_TO_CT_NAME
+                if current_ct in _LEGACY_REFERENCE_TO_CT_NAMES:
+                    current_ct = _DEFAULT_REFERENCE_TO_CT_NAME
+                self._ct_transform_name.text = current_ct
+            if self._needle_transform_name is not None:
+                current_needle = svalue("NeedleTransformName", _DEFAULT_POINTER_TO_CT_NAME) or _DEFAULT_POINTER_TO_CT_NAME
+                if current_needle in _LEGACY_POINTER_TO_CT_NAMES:
+                    current_needle = _DEFAULT_POINTER_TO_CT_NAME
+                self._needle_transform_name.text = current_needle
+            if self._invert_registration_matrix is not None:
+                self._invert_registration_matrix.checked = sbool("InvertRegistrationMatrix", False)
+            if self._smoothing_slider is not None:
+                try:
+                    strength = float(svalue("SmoothingStrength", _DEFAULT_SMOOTHING_STRENGTH))
+                except (TypeError, ValueError):
+                    strength = _DEFAULT_SMOOTHING_STRENGTH
+                strength = max(0.0, min(1.0, strength))
+                self._smoothing_slider.value = int(round(strength * 100))
+                self._update_smoothing_value_label(self._smoothing_slider.value)
+                if getattr(self, "logic", None) is not None:
+                    try:
+                        self.logic.set_smoothing_strength(strength)
+                    except Exception:
+                        pass
+            self._set_tracking_view_mode(svalue("TrackingViewMode", "tool_centric") or "tool_centric", save_setting=False)
+        finally:
+            self._suspend_settings_updates = False
+
+        # Update geometry button labels from loaded settings
+        # Restore self.phantomPath / self.toolPath and update status labels
+        if self._phantom_geometry_path is not None:
+            p = self._phantom_geometry_path.currentPath.strip()
+            if p and os.path.isfile(p):
+                self.phantomPath = p
+                if hasattr(self, "_phantom_status_label") and self._phantom_status_label is not None:
+                    self._phantom_status_label.setText(f"Phantom: {os.path.basename(p)}")
+                    self._phantom_status_label.setStyleSheet("color: #00cc66; font-size: 11px; padding: 2px 8px;")
+            else:
+                self.phantomPath = ""
+                if hasattr(self, "_phantom_status_label") and self._phantom_status_label is not None:
+                    self._phantom_status_label.setText("")
+        if self._tool_geometry_path is not None:
+            p = self._tool_geometry_path.currentPath.strip()
+            if p and os.path.isfile(p):
+                self.toolPath = p
+                if hasattr(self, "_tool_status_label") and self._tool_status_label is not None:
+                    self._tool_status_label.setText(f"Tool: {os.path.basename(p)}")
+                    self._tool_status_label.setStyleSheet("color: #00cc66; font-size: 11px; padding: 2px 8px;")
+            else:
+                self.toolPath = ""
+                if hasattr(self, "_tool_status_label") and self._tool_status_label is not None:
+                    self._tool_status_label.setText("")
+        self._update_plus_status_label()
+
+        self._refresh_session_summary()
+        self._sync_runtime_surface()
+
+    def _save_settings_from_ui(self):
+        if self._suspend_settings_updates:
+            return
+
+        settings = qt.QSettings()
+
+        def sset(name: str, value):
+            settings.setValue(_SETTINGS_PREFIX + name, value)
+
+        if self._dicom_folder_path is not None:
+            sset("DicomFolder", self._dicom_folder_path.currentPath)
+        if self._needle_stl_path is not None:
+            sset("NeedleStlPath", self._needle_stl_path.currentPath)
+        if self._registration_matrix_path is not None:
+            sset("RegistrationMatrixPath", self._registration_matrix_path.currentPath)
+        if self._plus_config_path is not None:
+            sset("PlusConfigPath", self._plus_config_path.currentPath)
+        if self._phantom_geometry_path is not None:
+            sset("PhantomGeometryPath", self._phantom_geometry_path.currentPath)
+        if self._tool_geometry_path is not None:
+            sset("ToolGeometryPath", self._tool_geometry_path.currentPath)
+        if self._plus_exe_path is not None:
+            sset("PlusExePath", self._plus_exe_path.currentPath)
+
+        if self._launcher_host is not None:
+            sset("PlusLauncherHost", self._launcher_host.text.strip())
+        if self._launcher_port is not None:
+            sset("PlusLauncherPort", int(self._launcher_port.value))
+
+        if self._igtl_host is not None:
+            sset("IgtlHost", self._igtl_host.text.strip())
+        if self._igtl_port is not None:
+            sset("IgtlPort", int(self._igtl_port.value))
+
+        if self._ct_transform_name is not None:
+            normalized_ct = self._current_reference_to_ct_name()
+            if (self._ct_transform_name.text or "").strip() != normalized_ct:
+                was_blocked = self._ct_transform_name.blockSignals(True)
+                self._ct_transform_name.text = normalized_ct
+                self._ct_transform_name.blockSignals(was_blocked)
+            sset("CtTransformName", normalized_ct)
+        if self._needle_transform_name is not None:
+            normalized_needle = self._current_pointer_to_ct_name()
+            if (self._needle_transform_name.text or "").strip() != normalized_needle:
+                was_blocked = self._needle_transform_name.blockSignals(True)
+                self._needle_transform_name.text = normalized_needle
+                self._needle_transform_name.blockSignals(was_blocked)
+            sset("NeedleTransformName", normalized_needle)
+        if self._invert_registration_matrix is not None:
+            sset("InvertRegistrationMatrix", bool(self._invert_registration_matrix.checked))
+        sset("TrackingViewMode", self._tracking_view_mode)
+
+    def _on_settings_fields_changed(self, *_args):
+        if self._suspend_settings_updates:
+            return
+        self._save_settings_from_ui()
+        self._refresh_runtime_from_scene()
+
+    def _set_running_ui(self, running: bool):
+        if self._start_button is not None:
+            self._start_button.enabled = not running
+        if self._auto_start_button is not None:
+            self._auto_start_button.enabled = not running
+        if self._stop_button is not None:
+            self._stop_button.enabled = running or self._tracking_connected
+        if self._auto_stop_button is not None:
+            self._auto_stop_button.enabled = running or self._tracking_connected
+
+        for widget in (
+            self._dicom_folder_path,
+            self._load_ct_button,
+            self._needle_stl_path,
+            self._load_needle_button,
+            self._plus_config_path,
+            self._launcher_host,
+            self._launcher_port,
+            self._igtl_host,
+            self._igtl_port,
+            self._ct_transform_name,
+            self._needle_transform_name,
+            self._initialize_tracking_button,
+            self._phantom_geometry_path,
+            self._tool_geometry_path,
+            self._plus_exe_path,
+            self._load_phantom_geometry_button if hasattr(self, "_load_phantom_geometry_button") else None,
+            self._load_tool_geometry_button if hasattr(self, "_load_tool_geometry_button") else None,
+        ):
+            if widget is not None:
+                widget.enabled = not running
+
+        self._sync_runtime_surface()
+
+    def _on_start_clicked(self):
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        if not all(
+            widget is not None
+            for widget in (
+                self._dicom_folder_path,
+                self._needle_stl_path,
+                self._registration_matrix_path,
+                self._plus_config_path,
+                self._launcher_host,
+                self._launcher_port,
+                self._ct_transform_name,
+                self._needle_transform_name,
+                self._invert_registration_matrix,
+            )
+        ):
+            slicer.util.errorDisplay("Home UI is not fully initialized.")
+            return
+
+        dicom_folder = self._dicom_folder_path.currentPath.strip()
+        needle_path = self._needle_stl_path.currentPath.strip()
+        registration_path = self._registration_matrix_path.currentPath.strip()
+        plus_config = self._plus_config_path.currentPath.strip() if self._plus_config_path else ""
+        host = self._launcher_host.text.strip() or "localhost" if self._launcher_host else "localhost"
+        port = int(self._launcher_port.value) if self._launcher_port else 18904
+        ct_transform = self._current_reference_to_ct_name()
+        needle_transform = self._current_pointer_to_ct_name()
+        invert_registration = bool(self._invert_registration_matrix.checked)
+
+        phantom_geometry = self._phantom_geometry_path.currentPath.strip() if self._phantom_geometry_path else ""
+        tool_geometry = self._tool_geometry_path.currentPath.strip() if self._tool_geometry_path else ""
+        plus_exe = self._plus_exe_path.currentPath.strip() if self._plus_exe_path else ""
+
+        # Auto-detect bundled PlusServer if user hasn't set a manual path
+        if not plus_exe:
+            plus_exe = SpineTrackerWorkflow.find_bundled_plus_server()
+            if plus_exe and self._plus_exe_path is not None:
+                self._plus_exe_path.currentPath = plus_exe
+
+        # Determine plus_mode: internal if geometry files and exe are provided
+        plus_mode = "internal" if (phantom_geometry and tool_geometry and plus_exe) else "external"
+
+        if not os.path.isdir(dicom_folder):
+            slicer.util.errorDisplay("Please select a valid DICOM folder.")
+            return
+        if not os.path.isfile(needle_path):
+            slicer.util.errorDisplay("Please select a valid needle STL file.")
+            return
+        if registration_path and not os.path.isfile(registration_path):
+            slicer.util.errorDisplay("Please select a valid registration matrix text file (or leave it empty and load later).")
+            return
+
+        if plus_mode == "internal":
+            if not os.path.isfile(plus_exe):
+                slicer.util.errorDisplay("Please select a valid PlusServer.exe path.")
+                return
+            if not os.path.isfile(phantom_geometry):
+                slicer.util.errorDisplay("Please select a valid phantom geometry .ini file.")
+                return
+            if not os.path.isfile(tool_geometry):
+                slicer.util.errorDisplay("Please select a valid tool geometry .ini file.")
+                return
+        else:
+            if not os.path.isfile(plus_config):
+                slicer.util.errorDisplay("Please select a valid PLUS config XML file.")
+                return
+
+        if self._launcher_host is not None:
+            self._launcher_host.text = host
+        self._save_settings_from_ui()
+
+        params = WorkflowParams(
+            dicom_folder=dicom_folder,
+            needle_stl_path=needle_path,
+            plus_config_path=plus_config,
+            registration_matrix_path=registration_path,
+            launcher_host=host,
+            launcher_port=port,
+            invert_registration_matrix=invert_registration,
+            ct_transform_name=ct_transform,
+            needle_transform_name=needle_transform,
+            plus_exe_path=plus_exe,
+            phantom_geometry_path=phantom_geometry,
+            tool_geometry_path=tool_geometry,
+            plus_mode=plus_mode,
+        )
+
+        self._tracking_connected = False
+        self._busy_workflow_active = True
+        self._busy_push()
+        self._set_running_ui(True)
+        self.logic.start(params, status_callback=self._on_workflow_status, error_callback=self._on_workflow_error)
+
+    def _pick_path_for_widget(
+        self,
+        path_widget: Optional[ctk.ctkPathLineEdit],
+        dialog_title: str,
+        *,
+        select_directory: bool = False,
+        file_filter: str = "All files (*)",
+    ) -> bool:
+        if path_widget is None:
+            return False
+
+        current_path = (path_widget.currentPath or "").strip()
+        if select_directory:
+            start_dir = current_path if os.path.isdir(current_path) else os.path.dirname(current_path)
+            selected_path = qt.QFileDialog.getExistingDirectory(
+                slicer.util.mainWindow(),
+                dialog_title,
+                start_dir or "",
+            )
+        else:
+            start_dir = os.path.dirname(current_path) if current_path else ""
+            selected_result = qt.QFileDialog.getOpenFileName(
+                slicer.util.mainWindow(),
+                dialog_title,
+                start_dir,
+                file_filter,
+            )
+            if isinstance(selected_result, (tuple, list)):
+                selected_path = selected_result[0]
+            else:
+                selected_path = selected_result
+
+        if not selected_path:
+            return False
+
+        path_widget.currentPath = selected_path
+        self._save_settings_from_ui()
+        return True
+
+    def _on_pick_and_load_ct_clicked(self):
+        if self._pick_path_for_widget(
+            self._dicom_folder_path,
+            "Select DICOM folder",
+            select_directory=True,
+        ):
+            self._on_load_ct_clicked()
+
+    def _on_pick_and_load_needle_clicked(self):
+        if self._pick_path_for_widget(
+            self._needle_stl_path,
+            "Select needle STL",
+            select_directory=False,
+            file_filter="STL files (*.stl);;All files (*)",
+        ):
+            self._on_load_needle_clicked()
+
+    def _on_pick_and_load_registration_clicked(self):
+        if self._pick_path_for_widget(
+            self._registration_matrix_path,
+            "Select registration matrix",
+            select_directory=False,
+            file_filter="Text files (*.txt *.csv *.tsv);;All files (*)",
+        ):
+            self._on_load_registration_clicked()
+
+    def _on_pick_phantom_geometry_clicked(self):
+        path = qt.QFileDialog.getOpenFileName(
+            slicer.util.mainWindow(), "Select Phantom Geometry", "", "Geometry files (*.ini);;All files (*)"
+        )
+        if path:
+            self.phantomPath = path
+            if self._phantom_geometry_path is not None:
+                self._phantom_geometry_path.currentPath = path
+            self._phantom_status_label.setText(f"Phantom: {os.path.basename(path)}")
+            self._phantom_status_label.setStyleSheet("color: #00cc66; font-size: 11px; padding: 2px 8px;")
+            self._update_plus_status_label()
+            self._save_settings_from_ui()
+
+    def _on_pick_tool_geometry_clicked(self):
+        path = qt.QFileDialog.getOpenFileName(
+            slicer.util.mainWindow(), "Select Tool Geometry", "", "Geometry files (*.ini);;All files (*)"
+        )
+        if path:
+            self.toolPath = path
+            if self._tool_geometry_path is not None:
+                self._tool_geometry_path.currentPath = path
+            self._tool_status_label.setText(f"Tool: {os.path.basename(path)}")
+            self._tool_status_label.setStyleSheet("color: #00cc66; font-size: 11px; padding: 2px 8px;")
+            self._update_plus_status_label()
+            self._save_settings_from_ui()
+
+    def _update_plus_status_label(self):
+        """Update the PlusServer status label based on current state."""
+        if not hasattr(self, "_plus_status_label") or self._plus_status_label is None:
+            return
+        phantom = self._phantom_geometry_path.currentPath.strip() if self._phantom_geometry_path else ""
+        tool = self._tool_geometry_path.currentPath.strip() if self._tool_geometry_path else ""
+        plus_exe = self._plus_exe_path.currentPath.strip() if self._plus_exe_path else ""
+
+        parts = []
+        if plus_exe and os.path.isfile(plus_exe):
+            parts.append("PlusServer: Found")
+        else:
+            parts.append("PlusServer: Not found")
+        if phantom and os.path.isfile(phantom):
+            parts.append(f"Phantom: {os.path.basename(phantom)}")
+        else:
+            parts.append("Phantom: Not loaded")
+        if tool and os.path.isfile(tool):
+            parts.append(f"Tool: {os.path.basename(tool)}")
+        else:
+            parts.append("Tool: Not loaded")
+
+        ready = all([
+            plus_exe and os.path.isfile(plus_exe),
+            phantom and os.path.isfile(phantom),
+            tool and os.path.isfile(tool),
+        ])
+        if ready:
+            color = "#00cc66"
+            parts.append("Ready to track")
+        else:
+            color = "#aaaaaa"
+            parts.append("Load geometry files to enable tracking")
+
+        self._plus_status_label.setText(" | ".join(parts))
+        self._plus_status_label.setStyleSheet(
+            f"color: {color}; font-size: 11px; padding: 4px 8px; "
+            f"border: 1px solid {'#00cc66' if ready else '#444444'}; border-radius: 4px; "
+            f"background: {'#0a2a1a' if ready else '#1a1a2e'};"
+        )
+
+    def _set_plus_status(self, message: str, success: bool = False, error: bool = False):
+        """Set the PlusServer status label to a specific message."""
+        if hasattr(self, "_plus_status_label") and self._plus_status_label is not None:
+            if success:
+                color, border, bg = "#00cc66", "#00cc66", "#0a2a1a"
+            elif error:
+                color, border, bg = "#ff4444", "#ff4444", "#2a0a0a"
+            else:
+                color, border, bg = "#ffaa00", "#ffaa00", "#2a1a0a"
+            self._plus_status_label.setText(message)
+            self._plus_status_label.setStyleSheet(
+                f"color: {color}; font-size: 11px; padding: 4px 8px; "
+                f"border: 1px solid {border}; border-radius: 4px; background: {bg};"
+            )
+        # Mirror onto the 2D-2D sidebar's PlusServer label so the user sees
+        # the same state whether PlusServer was launched from the 2D-2D page
+        # or from the 2D-3D / 3D-3D workflow.
+        self._update_2d_plus_status(message, success=success, error=error)
+
+    def _apply_2d_plus_status_style(self, success: bool, error: bool):
+        if self._2d_plus_status_label is None:
+            return
+        if success:
+            color, border, bg = "#5ddca5", "rgba(42, 160, 110, 160)", "rgba(42, 160, 110, 40)"
+        elif error:
+            color, border, bg = "#ff8a8a", "rgba(220, 64, 64, 160)", "rgba(220, 64, 64, 40)"
+        else:
+            color, border, bg = "#9fb4d8", "#24385c", "transparent"
+        self._2d_plus_status_label.setStyleSheet(
+            "QLabel#TwoDPlusStatus {"
+            f"  color: {color};"
+            f"  border: 1px solid {border};"
+            f"  background: {bg};"
+            "  border-radius: 10px;"
+            "  padding: 10px 14px;"
+            "  font-size: 14px;"
+            "  font-weight: 600;"
+            "}"
+        )
+
+    def _update_2d_plus_status(self, message: str, success: bool = False, error: bool = False):
+        if self._2d_plus_status_label is None:
+            return
+        prefix = "PlusServer: "
+        text = message if message.lower().startswith("plusserver") else f"{prefix}{message}"
+        self._2d_plus_status_label.setText(text)
+        self._apply_2d_plus_status_style(success=success, error=error)
+
+    def _sync_2d_plus_status_from_main(self):
+        """When the 2D-2D page is opened, populate the 2D PlusServer label
+        from whatever state the main workflow's status label is already in."""
+        if self._2d_plus_status_label is None:
+            return
+        if not hasattr(self, "_plus_status_label") or self._plus_status_label is None:
+            return
+        text = self._plus_status_label.text or ""
+        # Look at the existing label's stylesheet color tokens to infer state.
+        style = self._plus_status_label.styleSheet or ""
+        success = "#00cc66" in style
+        error = "#ff4444" in style
+        if not text:
+            return
+        self._update_2d_plus_status(text, success=success, error=error)
+
+    def _on_load_ct_clicked(self):
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        if not all(
+            widget is not None
+            for widget in (
+                self._dicom_folder_path,
+                self._ct_transform_name,
+            )
+        ):
+            slicer.util.errorDisplay("Home UI is not fully initialized.")
+            return
+
+        dicom_folder = self._dicom_folder_path.currentPath.strip()
+        ct_transform = self._current_reference_to_ct_name()
+
+        if not os.path.isdir(dicom_folder):
+            slicer.util.errorDisplay("Please select a valid DICOM folder.")
+            return
+
+        self._save_settings_from_ui()
+        self._begin_operation_progress("load_ct", "Loading CT...")
+        self._busy_push()
+        try:
+            self.logic.load_ct(
+                dicom_folder=dicom_folder,
+                ct_transform_name=ct_transform,
+                status_callback=self._on_workflow_status,
+                error_callback=self._on_workflow_error,
+            )
+            self._apply_default_window_level_if_needed(force=True)
+            if not self._active_progress_failed:
+                self._update_operation_progress(100, "CT loaded.")
+        finally:
+            self._finish_operation_progress()
+            self._busy_pop()
+
+    def _on_load_needle_clicked(self):
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        if not all(
+            widget is not None
+            for widget in (
+                self._needle_stl_path,
+                self._needle_transform_name,
+            )
+        ):
+            slicer.util.errorDisplay("Home UI is not fully initialized.")
+            return
+
+        needle_path = self._needle_stl_path.currentPath.strip()
+        needle_transform = self._current_pointer_to_ct_name()
+
+        if not os.path.isfile(needle_path):
+            slicer.util.errorDisplay("Please select a valid needle STL file.")
+            return
+
+        self._save_settings_from_ui()
+        self._begin_operation_progress("load_stl", "Loading STL...")
+        self._busy_push()
+        try:
+            self.logic.load_needle(
+                needle_path=needle_path,
+                needle_transform_name=needle_transform,
+                status_callback=self._on_workflow_status,
+                error_callback=self._on_workflow_error,
+            )
+            if not self._active_progress_failed:
+                self._update_operation_progress(100, "STL loaded.")
+        finally:
+            self._finish_operation_progress()
+            self._busy_pop()
+
+    def _on_initialize_tracking_clicked(self):
+        """Start Tracking: validate, generate config, launch PlusServer, monitor port."""
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        # 1. Check that both geometry paths are set
+        if not self.phantomPath or not os.path.isfile(self.phantomPath):
+            slicer.util.errorDisplay(
+                "Please load a Phantom geometry .ini file first.",
+                parent=self._active_modal_parent(),
+            )
+            return
+        if not self.toolPath or not os.path.isfile(self.toolPath):
+            slicer.util.errorDisplay(
+                "Please load a Tool geometry .ini file first.",
+                parent=self._active_modal_parent(),
+            )
+            return
+
+        # Find PlusServer.exe — prefer the user-configured path (same
+        # precedence as Start Navigate); fall back to the bundled server.
+        plusserver_path = self._plus_exe_path.currentPath.strip() if self._plus_exe_path else ""
+        if not plusserver_path or not os.path.isfile(plusserver_path):
+            plusserver_path = SpineTrackerWorkflow.find_bundled_plus_server()
+        if not plusserver_path or not os.path.isfile(plusserver_path):
+            slicer.util.errorDisplay(
+                "PlusServer.exe not found. Check that it is bundled or set the path in Additional Settings.",
+                parent=self._active_modal_parent(),
+            )
+            return
+
+        # 2. If PlusServer is already running, terminate it first
+        self._terminate_plus_process()
+
+        # 2b. If port 18944 is STILL open after terminating our own instance,
+        # a foreign/stale PlusServer owns it. Launching now would fail to
+        # bind, yet the port probe below would see the stale server and
+        # report "ready" — connecting navigation to a server running the
+        # wrong (or no) geometry. Refuse instead.
+        try:
+            probe = socket.create_connection(("localhost", 18944), timeout=0.25)
+            probe.close()
+            slicer.util.errorDisplay(
+                "Port 18944 is already in use by another PlusServer (possibly "
+                "left over from a previous session or another application "
+                "instance). Close it and try Init Tracking again.",
+                parent=self._active_modal_parent(),
+            )
+            self._set_plus_status("Port 18944 already in use", error=True)
+            return
+        except OSError:
+            pass  # port free — proceed
+
+        # 3. Clean up previous temp folder
+        if self.temp_dir is not None:
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception:
+                pass
+            self.temp_dir = None
+
+        # 4. Create new temp folder
+        self.temp_dir = tempfile.mkdtemp(prefix="SpineTracker_")
+
+        # 5. Copy both .ini files into the temp folder. Prefix the copies so
+        # two source files that share a basename (e.g. phantom\geometry.ini
+        # and tool\geometry.ini) cannot silently overwrite each other — that
+        # would make PlusServer track with the wrong marker geometry.
+        phantom_in_temp = os.path.join(self.temp_dir, "Phantom_" + os.path.basename(self.phantomPath))
+        tool_in_temp = os.path.join(self.temp_dir, "Tool_" + os.path.basename(self.toolPath))
+        shutil.copy(self.phantomPath, phantom_in_temp)
+        shutil.copy(self.toolPath, tool_in_temp)
+
+        # Diagnostic logging — surfaces input state on every launch so field
+        # issues on non-developer machines can be traced from the log file.
+        logging.info(
+            "PlusServer launch inputs — phantomPath=%s (exists=%s), toolPath=%s (exists=%s)",
+            self.phantomPath, os.path.isfile(self.phantomPath),
+            self.toolPath, os.path.isfile(self.toolPath),
+        )
+        logging.info("PlusServer launch temp_dir=%s", self.temp_dir)
+        if not os.path.isfile(phantom_in_temp):
+            logging.error("Phantom geometry copy missing after shutil.copy: %s", phantom_in_temp)
+        if not os.path.isfile(tool_in_temp):
+            logging.error("Tool geometry copy missing after shutil.copy: %s", tool_in_temp)
+
+        # 6. Read template XML, replace {PHANTOM} and {TOOL}, save as config.xml
+        template_path = os.path.join(os.path.dirname(__file__), "Resources", "Registration_Tracking_Template.xml")
+        if not os.path.isfile(template_path):
+            # Try installed location
+            if hasattr(slicer, "app"):
+                template_path = os.path.join(
+                    slicer.app.slicerHome, "share", "SpineTracker2-5.11", "Registration_Tracking_Template.xml"
+                )
+        if not os.path.isfile(template_path):
+            slicer.util.errorDisplay(
+                "Registration_Tracking_Template.xml not found.",
+                parent=self._active_modal_parent(),
+            )
+            return
+
+        with open(template_path, "r", encoding="utf-8") as f:
+            xml_content = f.read()
+        # Use ABSOLUTE forward-slash paths for GeometryFile so PlusServer does
+        # not depend on DeviceSetConfigurationDirectory from the installed
+        # PlusConfig.xml. This makes the launch portable across machines that
+        # do not have the developer's C:/plusserver2 (or any other hardcoded
+        # install-time) folder.
+        phantom_ref = phantom_in_temp.replace(os.sep, "/")
+        tool_ref = tool_in_temp.replace(os.sep, "/")
+        xml_content = xml_content.replace("{PHANTOM}", phantom_ref)
+        xml_content = xml_content.replace("{TOOL}", tool_ref)
+
+        config_path = os.path.join(self.temp_dir, "config.xml")
+        # utf-8 explicitly: the locale default (cp1252) raises UnicodeEncodeError
+        # when the temp path contains non-Latin characters (e.g. a non-ASCII
+        # Windows username), killing the launch with a raw traceback.
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        # 7. Launch PlusServer (cwd must be the PlusServer directory so it finds its DLLs)
+        plusserver_dir = os.path.dirname(plusserver_path)
+        atracsys_runtime_dirs, bundle_missing, unresolved_runtime_files = _resolve_atracsys_runtime_dirs(plusserver_dir)
+        launch_env = _build_subprocess_env([plusserver_dir] + atracsys_runtime_dirs)
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        # Inspect whatever PlusConfig.xml sits next to PlusServer.exe and log
+        # the DeviceSetConfigurationDirectory it advertises. This surfaces
+        # stale/hardcoded install paths during field diagnosis but has no
+        # effect on execution because our generated config.xml uses
+        # absolute geometry paths.
+        neighbour_plus_config = os.path.join(plusserver_dir, "PlusConfig.xml")
+        if os.path.isfile(neighbour_plus_config):
+            try:
+                with open(neighbour_plus_config, "r", encoding="utf-8", errors="replace") as _f:
+                    _neighbour_text = _f.read()
+                _m = re.search(r'DeviceSetConfigurationDirectory="([^"]*)"', _neighbour_text)
+                _dscd = _m.group(1) if _m else ""
+                _dscd_abs = ""
+                if _dscd:
+                    _dscd_abs = os.path.normpath(
+                        _dscd if os.path.isabs(_dscd) else os.path.join(plusserver_dir, _dscd)
+                    )
+                logging.info(
+                    "PlusServer neighbour PlusConfig.xml — DeviceSetConfigurationDirectory=%r resolved=%r exists=%s",
+                    _dscd, _dscd_abs, (os.path.isdir(_dscd_abs) if _dscd_abs else False),
+                )
+                if _dscd_abs and not os.path.isdir(_dscd_abs):
+                    logging.warning(
+                        "PlusServer DeviceSetConfigurationDirectory does not exist on this machine: %s "
+                        "(this is harmless — generated config.xml uses absolute geometry paths)",
+                        _dscd_abs,
+                    )
+            except Exception as _exc:
+                logging.warning("Could not inspect neighbouring PlusConfig.xml: %s", _exc)
+        else:
+            logging.info("PlusServer neighbour PlusConfig.xml not found at %s", neighbour_plus_config)
+
+        cmd = [plusserver_path, f"--config-file={config_path}"]
+        logging.info(
+            "PlusServer launch — exe=%s (exists=%s)", plusserver_path, os.path.isfile(plusserver_path)
+        )
+        logging.info(
+            "PlusServer launch — config=%s (exists=%s)", config_path, os.path.isfile(config_path)
+        )
+        logging.info("PlusServer launch — geometry (abs) phantom=%s tool=%s", phantom_ref, tool_ref)
+        logging.info("PlusServer launch — cwd=%s", plusserver_dir)
+        logging.info(
+            "PlusServer launch — PATH additions=%s",
+            "; ".join(_deduplicate_paths([plusserver_dir] + atracsys_runtime_dirs, require_existing=True)),
+        )
+        if bundle_missing:
+            logging.warning(
+                "Bundled PlusServer is missing Atracsys runtime companions: %s",
+                ", ".join(bundle_missing),
+            )
+        if unresolved_runtime_files:
+            logging.warning(
+                "Atracsys runtime companions still unresolved after fallback lookup: %s",
+                ", ".join(unresolved_runtime_files),
+            )
+        logging.info("PlusServer launch — command: %s", " ".join(cmd))
+
+        self._plus_log_path = os.path.join(self.temp_dir, "PlusServer.log")
+        try:
+            self._plus_log_file = open(self._plus_log_path, "w")
+            self.plus_process = subprocess.Popen(
+                cmd,
+                stdout=self._plus_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=plusserver_dir,
+                env=launch_env,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            self._set_plus_status(f"Failed to launch PlusServer: {exc}", error=True)
+            return
+
+        # Assign PlusServer to a Windows Job Object with KILL_ON_JOB_CLOSE.
+        # This is the bulletproof fallback: even if Slicer is killed via Task
+        # Manager, crashes hard, or loses power without running atexit, the
+        # OS will terminate PlusServer when the Job handle closes on Slicer
+        # process exit. No-op on non-Windows.
+        try:
+            _assign_process_to_plus_job(self.plus_process.pid)
+        except Exception:
+            pass
+
+        # Register atexit handler once — fallback for ungraceful shutdowns where
+        # cleanup() / aboutToQuit do not fire. Uses a dict so we can update the
+        # current process reference without registering multiple handlers.
+        if not self._plus_atexit_registered:
+            self._plus_proc_ref = {"proc": self.plus_process}
+            atexit.register(HomeWidget._atexit_kill_plus_process, self._plus_proc_ref)
+            self._plus_atexit_registered = True
+        else:
+            # Update the ref so the handler kills the current process
+            self._plus_proc_ref["proc"] = self.plus_process
+
+        # 8. Show status and disable button
+        self._set_plus_status("Starting PlusServer...", success=False, error=False)
+        if self._initialize_tracking_button is not None:
+            self._initialize_tracking_button.enabled = False
+        # Start Tracking stays disabled until the server reports ready.
+        if self._start_tracking_button is not None:
+            self._start_tracking_button.enabled = False
+
+        # 9. Start QTimer to check port 18944 every 500ms
+        if self._port_check_timer is not None:
+            self._port_check_timer.stop()
+            self._port_check_timer.deleteLater()
+        self._port_check_start_time = time.time()
+        self._port_check_timer = qt.QTimer()
+        self._port_check_timer.setInterval(500)
+        self._port_check_timer.timeout.connect(self._check_plus_server_port)
+        self._port_check_timer.start()
+
+    def _on_start_tracking_clicked(self):
+        """Start Tracking (2D-3D / 3D-3D): connect the OpenIGTLink stream and
+        begin tracking. Init Tracking must have launched PlusServer first."""
+        server_ready = False
+        try:
+            conn = socket.create_connection(("localhost", 18944), timeout=0.25)
+            conn.close()
+            server_ready = True
+        except OSError:
+            server_ready = False
+        if not server_ready:
+            slicer.util.errorDisplay(
+                "PlusServer is not ready yet. Click Init Tracking and wait for "
+                "\"PlusServer ready\" before Start Tracking.",
+                parent=self._active_modal_parent(),
+            )
+            return
+        self._set_plus_status("Tracking active", success=True)
+        self._connect_igtl_after_plus_started()
+        if self._start_tracking_button is not None:
+            self._start_tracking_button.enabled = False
+
+    def _check_plus_server_port(self):
+        """Called by QTimer every 500ms to check if PlusServer port 18944 is accepting connections."""
+        # Check if process crashed
+        if self.plus_process is not None and self.plus_process.poll() is not None:
+            self._port_check_timer.stop()
+            self._port_check_timer.deleteLater()
+            self._port_check_timer = None
+            rc = self.plus_process.returncode
+            log_tail = ""
+            if hasattr(self, "_plus_log_path") and os.path.isfile(self._plus_log_path):
+                try:
+                    with open(self._plus_log_path, "r") as f:
+                        log_tail = f.read()[-500:]
+                except Exception:
+                    pass
+            # Detect geometry-load failures before generic tracker connect errors.
+            marker_load_match = re.search(
+                r"Unable to load marker\..*?path:\s*([^|\r\n]+)",
+                log_tail,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if marker_load_match:
+                marker_path = marker_load_match.group(1).strip()
+                self._set_plus_status("Geometry file could not be loaded", error=True)
+                slicer.util.warningDisplay(
+                    "Atracsys marker geometry could not be loaded.\n\n"
+                    f"PlusServer tried to load:\n{marker_path}\n\n"
+                    "Please verify the selected Phantom/Tool geometry files and try again.",
+                    "Geometry Load Failed",
+                    parent=self._active_modal_parent(),
+                )
+            # Detect camera/tracker not connected
+            elif "ConnectInternal failed" in log_tail or "Cannot connect to device" in log_tail:
+                self._set_plus_status("Camera not connected", error=True)
+                if self._shell_dialog is not None and self._shell_dialog.isVisible() and self._registration_mode == "2d_2d":
+                    self._set_2d_status("Camera not connected — connect the Atracsys tracker via USB and try again.")
+                slicer.util.warningDisplay(
+                    "Atracsys tracker camera is not connected.\n\n"
+                    "Please connect the camera via USB and try again.",
+                    "Camera Not Connected",
+                    parent=self._active_modal_parent(),
+                )
+            else:
+                msg = f"Server failed to start (exit code {rc})"
+                if log_tail:
+                    msg += f"\n{log_tail}"
+                self._set_plus_status(msg, error=True)
+            logging.error("PlusServer failed: exit code %d, log: %s", rc, log_tail)
+            if self._initialize_tracking_button is not None:
+                self._initialize_tracking_button.enabled = True
+            # Full cleanup (not just plus_process = None): closes the log-file
+            # write handle (which would otherwise block temp-dir deletion on
+            # Windows) and clears the atexit proc reference.
+            self._terminate_plus_process()
+            return
+
+        # Check if port is accepting connections
+        try:
+            # Short timeout: this runs on the GUI thread every 500 ms, so a
+            # long blocking connect would stall the UI. localhost refusals
+            # return instantly; the timeout only caps a half-open SYN hang.
+            conn = socket.create_connection(("localhost", 18944), timeout=0.25)
+            conn.close()
+            # Port is open — PlusServer is ready
+            self._port_check_timer.stop()
+            self._port_check_timer.deleteLater()
+            self._port_check_timer = None
+            if self._initialize_tracking_button is not None:
+                self._initialize_tracking_button.enabled = True
+            # In the 2D-2D workflow the OpenIGTLink stream is connected
+            # automatically here (its own Start Tracking button only drives the
+            # overlay refresh). In the 2D-3D / 3D-3D workflow the operator must
+            # click Start Tracking explicitly, so we stop at "server ready" and
+            # arm that button instead of connecting the stream now.
+            if self._registration_mode == "2d_2d":
+                self._set_plus_status("Tracking active", success=True)
+                self._connect_igtl_after_plus_started()
+            else:
+                self._set_plus_status("PlusServer ready — click Start Tracking", success=True)
+                if self._start_tracking_button is not None:
+                    self._start_tracking_button.enabled = True
+            return
+        except OSError:
+            pass
+
+        # Check for 30-second timeout
+        elapsed = time.time() - self._port_check_start_time
+        if elapsed > 30.0:
+            self._port_check_timer.stop()
+            self._port_check_timer.deleteLater()
+            self._port_check_timer = None
+            self._terminate_plus_process()
+            self._set_plus_status("Timeout -- server did not start", error=True)
+            if self._initialize_tracking_button is not None:
+                self._initialize_tracking_button.enabled = True
+
+    def _connect_igtl_after_plus_started(self):
+        """After PlusServer starts, connect OpenIGTLink to receive transforms."""
+        try:
+            host = self._igtl_host.text.strip() if self._igtl_host else "localhost"
+            port = int(self._igtl_port.value) if self._igtl_port else 18944
+            ct_transform = self._current_reference_to_ct_name()
+            needle_transform = self._current_pointer_to_ct_name()
+            expected_transforms = self._get_expected_transforms_from_plus_config()
+            launcher_host = self._launcher_host.text.strip() if self._launcher_host else "localhost"
+            launcher_port = int(self._launcher_port.value) if self._launcher_port else 18904
+            plus_config = self._plus_config_path.currentPath.strip() if self._plus_config_path else ""
+
+            connected = self.logic.initialize_tracking(
+                igtl_host=host,
+                igtl_port=port,
+                ct_transform_name=ct_transform,
+                needle_transform_name=needle_transform,
+                expected_transform_names=expected_transforms,
+                launcher_host=launcher_host,
+                launcher_port=launcher_port,
+                plus_config_path=plus_config,
+                status_callback=self._on_workflow_status,
+                error_callback=self._on_workflow_error,
+                plus_exe_path="",
+                phantom_geometry_path=self.phantomPath,
+                tool_geometry_path=self.toolPath,
+            )
+            # initialize_tracking reports failures via error_callback and
+            # returns False rather than raising — do not claim a connection
+            # (or start the reslice retry loop) unless it actually succeeded.
+            if not connected:
+                self._tracking_connected = False
+                self._set_plus_status("PlusServer running, but IGTL connect failed", error=True)
+                return
+            self._tracking_connected = True
+            # Auto-open the Volume Reslice Driver so the 2D views start showing
+            # tracking immediately — the user should not have to click the
+            # "Volume Reslicer" button manually.
+            self._auto_start_volume_reslice_driver()
+        except Exception as exc:
+            logging.exception("Failed to connect OpenIGTLink after PlusServer start")
+            self._set_plus_status(f"PlusServer running, but IGTL connect failed: {exc}", error=True)
+
+    def _auto_start_volume_reslice_driver(self, _attempt: int = 0):
+        """Configure the Volume Reslice Driver automatically once the needle
+        transform is present. Retries a few times because transforms arrive
+        asynchronously after PlusServer connects."""
+        MAX_ATTEMPTS = 20  # ~10 seconds at 500ms
+        try:
+            # Precondition: a needle transform must exist in the scene.
+            if self._find_needle_transform_for_reslicing() is None:
+                raise RuntimeError("needle transform not yet in scene")
+            self._configure_volume_reslice_driver()
+            return
+        except Exception as exc:
+            if _attempt + 1 >= MAX_ATTEMPTS:
+                logging.info(
+                    "Auto-start of Volume Reslice Driver gave up after %d attempts: %s",
+                    MAX_ATTEMPTS, exc,
+                )
+                return
+            qt.QTimer.singleShot(
+                500,
+                lambda: self._auto_start_volume_reslice_driver(_attempt + 1),
+            )
+
+    def _terminate_plus_process(self):
+        """Terminate the PlusServer subprocess if running."""
+        # Close the log file handle first
+        if hasattr(self, "_plus_log_file") and self._plus_log_file is not None:
+            try:
+                self._plus_log_file.close()
+            except Exception:
+                pass
+            self._plus_log_file = None
+
+        if self.plus_process is None:
+            return
+        try:
+            self.plus_process.terminate()
+            try:
+                self.plus_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.plus_process.kill()
+                self.plus_process.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            # TimeoutExpired (a SubprocessError, not an OSError) from the
+            # post-kill wait must not escape: it would abort the caller's
+            # cleanup (temp dir, UI reset) mid-way.
+            pass
+        self.plus_process = None
+        # Clear the atexit reference so a stale process isn't targeted later
+        if hasattr(self, "_plus_proc_ref") and isinstance(self._plus_proc_ref, dict):
+            self._plus_proc_ref["proc"] = None
+
+    def _shutdown_plus_on_quit(self):
+        """Connected to slicer.app.aboutToQuit — kill PlusServer before Slicer exits."""
+        try:
+            self._terminate_plus_process()
+        except Exception:
+            pass
+        # Clean up temp folder too so it does not leak on every session.
+        if self.temp_dir is not None:
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception:
+                pass
+            self.temp_dir = None
+
+    @staticmethod
+    def _atexit_kill_plus_process(proc_ref):
+        """Module-level atexit handler: force-kill a PlusServer Popen even if the
+        widget has already been torn down. proc_ref is a weakref-like dict with a
+        'proc' key so we do not hold the widget alive."""
+        try:
+            proc = proc_ref.get("proc") if isinstance(proc_ref, dict) else None
+            if proc is None or proc.poll() is not None:
+                return
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_open_reslicer_clicked(self):
+        if hasattr(slicer.modules, "openvolumereslicer"):
+            slicer.util.selectModule("OpenVolumeReslicer")
+            qt.QTimer.singleShot(0, lambda: self._ensure_back_button_in_module("openvolumereslicer"))
+            return
+
+        if hasattr(slicer.modules, "volumereslicedriver"):
+            try:
+                self._configure_volume_reslice_driver()
+            except Exception as exc:
+                slicer.util.errorDisplay(str(exc))
+                return
+            slicer.util.selectModule("VolumeResliceDriver")
+            qt.QTimer.singleShot(0, lambda: self._ensure_back_button_in_module("volumereslicedriver"))
+            return
+
+        slicer.util.errorDisplay("OpenVolumeReslicer/VolumeResliceDriver module is not available in this build.")
+
+    def _on_open_openigtlink_clicked(self):
+        self._open_module_for_debug("openigtlinkif", "OpenIGTLinkIF")
+
+    def _on_open_transforms_clicked(self):
+        self._open_module_for_debug("transforms", "Transforms")
+
+    def _open_module_for_debug(self, module_attr: str, module_name: str):
+        if not hasattr(slicer.modules, module_attr):
+            slicer.util.errorDisplay(f"{module_name} module is not available in this build.")
+            return
+
+        slicer.util.selectModule(module_name)
+        qt.QTimer.singleShot(0, lambda: self._ensure_back_button_in_module(module_attr))
+
+    def _ensure_back_button_in_module(self, module_attr: str):
+        try:
+            module = getattr(slicer.modules, module_attr)
+        except Exception:
+            return
+
+        try:
+            widget = module.widgetRepresentation()
+        except Exception:
+            widget = None
+        if widget is None:
+            return
+
+        # Avoid duplicates
+        try:
+            existing = slicer.util.findChild(widget, "SpineTracker2BackBar")
+        except Exception:
+            existing = None
+        if existing is not None:
+            return
+
+        bar = qt.QWidget()
+        bar.objectName = "SpineTracker2BackBar"
+        bar_layout = qt.QHBoxLayout(bar)
+        bar_layout.setContentsMargins(12, 8, 12, 0)
+        bar_layout.setSpacing(8)
+
+        back_button = qt.QPushButton("Back")
+        back_button.objectName = "SecondaryButton"
+        back_button.setToolTip("Return to TrackVision Home workflow")
+        back_button.clicked.connect(lambda: slicer.util.selectModule("Home"))
+        bar_layout.addWidget(back_button, 0)
+        bar_layout.addStretch(1)
+
+        layout = widget.layout()
+        if layout is None:
+            layout = qt.QVBoxLayout(widget)
+            widget.setLayout(layout)
+        try:
+            layout.setMenuBar(bar)
+        except Exception:
+            try:
+                layout.insertWidget(0, bar)
+            except Exception:
+                layout.addWidget(bar)
+        try:
+            layout.activate()
+        except Exception:
+            pass
+        try:
+            bar.show()
+            widget.update()
+        except Exception:
+            pass
+
+    def _configure_volume_reslice_driver(self):
+        if self._needle_transform_name is None:
+            raise RuntimeError("Needle transform name is not set")
+
+        needle_transform_name = self._current_pointer_to_ct_name()
+        needle_transform = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", needle_transform_name)
+        if needle_transform is None:
+            raise RuntimeError(f"Needle transform '{needle_transform_name}' not found. Initialize tracking first.")
+
+        ct_volume = self._find_best_scalar_volume_in_scene()
+        if ct_volume is None:
+            raise RuntimeError("CT volume not found. Load CT first.")
+
+        # Ensure slice views exist
+        try:
+            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        except Exception:
+            pass
+
+        try:
+            slicer.util.setSliceViewerLayers(background=ct_volume)
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+
+        reslice_logic = slicer.modules.volumereslicedriver.logic()
+        if reslice_logic is None:
+            raise RuntimeError("VolumeResliceDriver logic is not available")
+
+        layout_manager = slicer.app.layoutManager()
+        should_drive_slices = self._tracking_view_mode in ("tool_centric", "scan_centric", "tool_dynamic")
+        mode_map = _slice_driver_mode_map_for_tracking_view_mode(self._tracking_view_mode)
+
+        for view_name, mode in mode_map:
+            try:
+                slice_widget = layout_manager.sliceWidget(view_name)
+                if slice_widget is None:
+                    continue
+                slice_node = slice_widget.mrmlSliceNode()
+                if slice_node is None:
+                    continue
+                if should_drive_slices:
+                    reslice_logic.SetDriverForSlice(needle_transform.GetID(), slice_node)
+                    reslice_logic.SetModeForSlice(int(mode), slice_node)
+                else:
+                    reslice_logic.SetDriverForSlice("", slice_node)
+            except Exception:
+                # Best-effort only: layout may not provide all slice views
+                pass
+
+        # Keep the needle's 2D display in sync with the view mode: projection in
+        # scan-centric (slice planes cut across the needle, so intersection is
+        # just a dot), intersection in the tool-aligned modes.
+        try:
+            needle_model = self._find_scene_needle_model(needle_transform)
+            needle_display = needle_model.GetDisplayNode() if needle_model is not None else None
+            if needle_display is not None:
+                if self._tracking_view_mode == "scan_centric":
+                    needle_display.SetSliceDisplayModeToProjection()
+                else:
+                    needle_display.SetSliceDisplayModeToIntersection()
+        except Exception:
+            pass
+
+        if should_drive_slices:
+            self._jump_slices_to_transform_position(needle_transform)
+            if self._tracking_view_mode == "scan_centric":
+                for view_name in ("Red", "Yellow", "Green"):
+                    try:
+                        slice_widget = layout_manager.sliceWidget(view_name)
+                    except Exception:
+                        slice_widget = None
+                    if slice_widget is None:
+                        continue
+                    slice_logic = slice_widget.sliceLogic() if hasattr(slice_widget, "sliceLogic") else None
+                    if slice_logic is not None:
+                        try:
+                            slice_logic.FitSliceToBackground()
+                        except Exception:
+                            pass
+                    slice_node = slice_widget.mrmlSliceNode() if hasattr(slice_widget, "mrmlSliceNode") else None
+                    current_fov = _slice_node_field_of_view(slice_node)
+                    if current_fov is None:
+                        continue
+                    _set_slice_node_field_of_view(slice_node, _scan_centric_zoomed_fov(current_fov))
+        else:
+            self._restore_scan_centric_slice_views(needle_transform)
+
+    def _jump_slices_to_position(self, x: float, y: float, z: float):
+        try:
+            slicer.vtkMRMLSliceNode.JumpAllSlices(
+                slicer.mrmlScene,
+                x,
+                y,
+                z,
+                slicer.vtkMRMLSliceNode.CenteredJumpSlice,
+            )
+        except Exception:
+            pass
+
+    def _jump_slices_to_transform_position(self, transform_node):
+        if transform_node is None:
+            return
+        try:
+            matrix = vtk.vtkMatrix4x4()
+            transform_node.GetMatrixTransformToParent(matrix)
+        except Exception:
+            return
+        self._jump_slices_to_position(
+            float(matrix.GetElement(0, 3)),
+            float(matrix.GetElement(1, 3)),
+            float(matrix.GetElement(2, 3)),
+        )
+
+    def _set_slice_node_orientation(self, slice_node, orientation_name: str):
+        if slice_node is None:
+            return
+        try:
+            slice_node.SetOrientation(str(orientation_name))
+            return
+        except Exception:
+            pass
+        method = getattr(slice_node, f"SetOrientationTo{orientation_name}", None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+
+    def _restore_scan_centric_slice_views(self, transform_node=None):
+        try:
+            slicer.util.resetSliceViews()
+        except Exception:
+            pass
+
+        try:
+            layout_manager = slicer.app.layoutManager()
+        except Exception:
+            layout_manager = None
+        if layout_manager is not None:
+            for view_name, orientation_name in (
+                ("Red", "Axial"),
+                ("Yellow", "Sagittal"),
+                ("Green", "Coronal"),
+            ):
+                try:
+                    slice_widget = layout_manager.sliceWidget(view_name)
+                    if slice_widget is None:
+                        continue
+                    slice_node = slice_widget.mrmlSliceNode()
+                    if slice_node is None:
+                        continue
+                    self._set_slice_node_orientation(slice_node, orientation_name)
+                except Exception:
+                    continue
+
+        if transform_node is not None:
+            self._jump_slices_to_transform_position(transform_node)
+
+    def _find_best_scalar_volume_in_scene(self):
+        volume_nodes = list(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
+        if not volume_nodes:
+            return None
+        if len(volume_nodes) == 1:
+            return volume_nodes[0]
+
+        def voxel_count(volume_node) -> int:
+            image = volume_node.GetImageData()
+            if image is None:
+                return 0
+            dims = image.GetDimensions()
+            return int(dims[0]) * int(dims[1]) * int(dims[2])
+
+        volume_nodes.sort(key=voxel_count, reverse=True)
+        return volume_nodes[0]
+
+    def _find_transform_node(self, name: str):
+        node = slicer.util.getFirstNodeByClassByName("vtkMRMLTransformNode", name)
+        if node is not None:
+            return node
+        for transform_node in slicer.util.getNodesByClass("vtkMRMLTransformNode"):
+            try:
+                if transform_node.GetName() == name:
+                    return transform_node
+            except Exception:
+                continue
+        return None
+
+    def _on_plus_config_path_changed(self, _path: str):
+        self._maybe_autofill_transforms_from_plus_config()
+        self._refresh_session_summary()
+
+    def _maybe_autofill_transforms_from_plus_config(self):
+        if self._plus_config_path is None or self._ct_transform_name is None or self._needle_transform_name is None:
+            return
+        xml_path = (self._plus_config_path.currentPath or "").strip()
+        if not xml_path or not os.path.isfile(xml_path):
+            return
+
+        transform_names = self._parse_plus_config_transform_names(xml_path)
+        if not transform_names:
+            return
+
+        suggested_needle, suggested_ct = self._suggest_transform_names_from_stream(transform_names)
+
+        current_needle = self._needle_transform_name.text.strip()
+        if (not current_needle) or (current_needle in _LEGACY_POINTER_TO_CT_NAMES and suggested_needle):
+            self._needle_transform_name.text = suggested_needle
+
+        current_ct = self._ct_transform_name.text.strip()
+        if (not current_ct) or (current_ct in _LEGACY_REFERENCE_TO_CT_NAMES and suggested_ct):
+            self._ct_transform_name.text = suggested_ct
+
+        if not self._suspend_settings_updates:
+            self._save_settings_from_ui()
+            self._refresh_session_summary()
+
+    def _get_expected_transforms_from_plus_config(self) -> list[str]:
+        if self._plus_config_path is None:
+            return []
+        xml_path = (self._plus_config_path.currentPath or "").strip()
+        if not xml_path or not os.path.isfile(xml_path):
+            return []
+        try:
+            return self._parse_plus_config_transform_names(xml_path)
+        except Exception:
+            return []
+
+    def _parse_plus_config_transform_names(self, xml_path: str) -> list[str]:
+        try:
+            with open(xml_path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+        except Exception:
+            return []
+
+        try:
+            root = ET.fromstring(content)
+        except Exception:
+            return []
+
+        names: list[str] = []
+        for elem in root.findall(".//TransformNames/Transform"):
+            name = elem.get("Name")
+            if name:
+                names.append(str(name))
+
+        # Preserve order, remove duplicates
+        seen = set()
+        unique: list[str] = []
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        return unique
+
+    def _suggest_transform_names_from_stream(self, transform_names: list[str]) -> tuple[str, str]:
+        lowered = {name.lower() for name in transform_names}
+        if "pointertotracker" in lowered and "referencetotracker" in lowered:
+            return _DEFAULT_POINTER_TO_CT_NAME, _DEFAULT_REFERENCE_TO_CT_NAME
+
+        has_pointer = any(name.lower().startswith("pointerto") for name in transform_names)
+        has_reference = any(name.lower().startswith("referenceto") for name in transform_names)
+        if has_pointer and has_reference:
+            return _DEFAULT_POINTER_TO_CT_NAME, _DEFAULT_REFERENCE_TO_CT_NAME
+
+        return _DEFAULT_POINTER_TO_CT_NAME, _DEFAULT_REFERENCE_TO_CT_NAME
+
+    def _on_load_registration_clicked(self):
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        if not all(
+            widget is not None
+            for widget in (
+                self._registration_matrix_path,
+                self._invert_registration_matrix,
+                self._ct_transform_name,
+            )
+        ):
+            slicer.util.errorDisplay("Home UI is not fully initialized.")
+            return
+
+        matrix_path = self._registration_matrix_path.currentPath.strip()
+        invert = bool(self._invert_registration_matrix.checked)
+        ct_transform = self._current_reference_to_ct_name()
+
+        if not os.path.isfile(matrix_path):
+            slicer.util.errorDisplay("Please select a valid registration matrix text file.")
+            return
+
+        self._save_settings_from_ui()
+        self._begin_operation_progress("load_registration", "Applying matrix...")
+        self._busy_push()
+        try:
+            self.logic.apply_registration(
+                matrix_path=matrix_path,
+                invert=invert,
+                ct_transform_name=ct_transform,
+                status_callback=self._on_workflow_status,
+                error_callback=self._on_workflow_error,
+            )
+            if not self._active_progress_failed:
+                self._update_operation_progress(100, "Registration applied.")
+        finally:
+            self._finish_operation_progress()
+            self._busy_pop()
+
+    def _on_paste_registration_clicked(self):
+        if self._error_label is not None:
+            self._error_label.visible = False
+            self._error_label.text = ""
+
+        if not all(
+            widget is not None
+            for widget in (
+                self._invert_registration_matrix,
+                self._ct_transform_name,
+            )
+        ):
+            slicer.util.errorDisplay("Home UI is not fully initialized.")
+            return
+
+        invert = bool(self._invert_registration_matrix.checked) if self._invert_registration_matrix is not None else True
+        ct_transform = self._current_reference_to_ct_name()
+
+        default_text = self._last_pasted_registration_text or ""
+        text, ok = qt.QInputDialog.getMultiLineText(
+            self.uiWidget,
+            "Paste Registration Matrix",
+            "Paste 4x4 registration matrix (16 numbers). Lines starting with # are ignored.",
+            default_text,
+        )
+        if not ok:
+            return
+        matrix_text = (text or "").strip()
+        if not matrix_text:
+            slicer.util.errorDisplay("Registration matrix text is empty.")
+            return
+
+        self._last_pasted_registration_text = matrix_text
+        self._begin_operation_progress("paste_registration", "Applying pasted matrix...")
+        self._busy_push()
+        try:
+            self.logic.apply_registration_text(
+                matrix_text=matrix_text,
+                invert=invert,
+                ct_transform_name=ct_transform,
+                status_callback=self._on_workflow_status,
+                error_callback=self._on_workflow_error,
+            )
+            if not self._active_progress_failed:
+                self._update_operation_progress(100, "Registration applied.")
+        finally:
+            self._finish_operation_progress()
+            self._busy_pop()
+
+    def _on_stop_clicked(self):
+        try:
+            self.logic.stop()
+        finally:
+            # Stop port-check timer if running
+            if self._port_check_timer is not None:
+                self._port_check_timer.stop()
+                self._port_check_timer = None
+
+            # Terminate PlusServer subprocess
+            self._terminate_plus_process()
+
+            # Delete temp folder
+            if self.temp_dir is not None:
+                try:
+                    shutil.rmtree(self.temp_dir)
+                except Exception:
+                    pass
+                self.temp_dir = None
+
+            self._busy_workflow_active = False
+            self._busy_clear()
+            self._tracking_connected = False
+            self._runtime_motion_seen = False
+            self._last_runtime_needle_transform_id = ""
+            self._last_runtime_needle_matrix = None
+            self._tracking_accuracy_samples = []
+            self._window_level_defaults_volume_id = ""
+            self._set_running_ui(False)
+            self._set_status("tracking", _StatusState.WAIT, "Tracking: idle")
+            self._set_plus_status("Tracking stopped")
+            if self._start_tracking_button is not None:
+                self._start_tracking_button.enabled = False
+            self._refresh_runtime_from_scene()
+
+    def _on_workflow_status(self, key: str, state: str, text: str):
+        self._set_status(key, state, text)
+        if key == "ct" and state == _StatusState.OK:
+            self._apply_default_window_level_if_needed(force=False)
+        # Update PlusServer status label for launcher/server events
+        if key in ("launcher", "server"):
+            if state == _StatusState.OK:
+                self._set_plus_status(text, success=True)
+            elif state == _StatusState.FAIL:
+                self._set_plus_status(text, error=True)
+            else:
+                self._set_plus_status(text)
+        self._refresh_session_summary()
+        if self._active_progress_operation:
+            progress_percent = self._progress_percent_for_status(self._active_progress_operation, key, state)
+            if progress_percent is not None:
+                self._update_operation_progress(progress_percent, text)
+        if self._busy_workflow_active and key == "tracking" and state == _StatusState.OK:
+            self._busy_workflow_active = False
+            self._busy_pop()
+
+    def _on_workflow_error(self, message: str):
+        if self._active_progress_operation:
+            self._active_progress_failed = True
+            self._finish_operation_progress()
+        self._busy_workflow_active = False
+        self._busy_clear()
+        if self._error_label is not None:
+            self._error_label.text = message
+            self._error_label.visible = True
+        self._set_plus_status(f"Error: {message}", error=True)
+        slicer.util.errorDisplay(message)
+        self._set_running_ui(False)
+        self._refresh_session_summary()
+
+    def setSlicerUIVisible(self, visible: bool):
+        slicer.util.setDataProbeVisible(visible)
+        slicer.util.setMenuBarsVisible(visible)
+        slicer.util.setModuleHelpSectionVisible(visible)
+        slicer.util.setModulePanelTitleVisible(visible)
+        slicer.util.setPythonConsoleVisible(visible)
+        slicer.util.setApplicationLogoVisible(visible)
+        slicer.util.setToolbarsVisible(visible)
+
+    def modifyWindowUI(self):
+        """Apply the focused TrackVision workspace chrome."""
+        # Custom toolbars
+        _mw = slicer.util.mainWindow()
+        if _mw is not None:
+            _mw.setWindowTitle("TrackVision")
+        self.initializeSettingsToolBar()
+        self._move_module_panel_to_right()
+        self._install_sidebar_toggle()
+        self._install_python_console_shortcut()
+
+    def _install_python_console_shortcut(self):
+        """Bind Ctrl+3 to toggle the Slicer Python console.
+
+        The standard console is hidden as part of the focused SpineTracker2
+        chrome, so this gives a quick keyboard escape hatch to bring it back
+        for debugging.
+        """
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        if getattr(self, "_python_console_shortcut", None) is not None:
+            return
+        shortcut = qt.QShortcut(main_window)
+        shortcut.setKey(qt.QKeySequence("Ctrl+3"))
+        # Application-wide so it fires regardless of which widget has focus.
+        shortcut.setContext(qt.Qt.ApplicationShortcut)
+        shortcut.activated.connect(self._toggle_python_console)
+        self._python_console_shortcut = shortcut
+
+    def _toggle_python_console(self):
+        """Show/hide the Python console, raising and focusing it when shown."""
+        main_window = slicer.util.mainWindow()
+        dock = None
+        if main_window is not None:
+            try:
+                dock = slicer.util.findChild(main_window, "PythonConsoleDockWidget")
+            except Exception:
+                dock = None
+        if dock is None:
+            # Fallback: no dock found — just force the console visible.
+            try:
+                slicer.util.setPythonConsoleVisible(True)
+            except Exception:
+                pass
+            return
+        make_visible = not dock.visible
+        dock.setVisible(make_visible)
+        if make_visible:
+            dock.raise_()
+            try:
+                slicer.util.pythonConsole().setFocus()
+            except Exception:
+                pass
+
+    def _set_sidebar_tab(self, index: int):
+        """Switch the sidebar's QStackedWidget to the given tab (0=Tracking, 1=Accuracy).
+
+        This only changes which page is visible; all widgets remain parented and
+        alive, so tracking, PlusServer, and accuracy data are preserved across
+        switches.
+        """
+        stack = getattr(self, "_sidebar_stack", None)
+        if stack is None:
+            return
+        index = 0 if index <= 0 else 1
+        try:
+            stack.setCurrentIndex(index)
+        except Exception:
+            return
+        tracking_btn = getattr(self, "_sidebar_tracking_tab_button", None)
+        accuracy_btn = getattr(self, "_sidebar_accuracy_tab_button", None)
+        for btn, want_checked in ((tracking_btn, index == 0), (accuracy_btn, index == 1)):
+            if btn is None:
+                continue
+            try:
+                was_blocked = btn.blockSignals(True)
+                btn.setChecked(bool(want_checked))
+                btn.blockSignals(was_blocked)
+            except Exception:
+                pass
+
+    def _set_sidebar_visible(self, visible: bool):
+        """Hide or show the module panel sidebar. When hidden, a small floating
+        reveal button is shown on the main window to bring it back."""
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        panel_dock = slicer.util.findChild(main_window, "PanelDockWidget")
+        if panel_dock is None:
+            return
+        try:
+            panel_dock.setVisible(bool(visible))
+        except Exception:
+            pass
+        # Keep toolbar toggle's checked state in sync if it exists
+        toggle = getattr(self, "_sidebar_toggle_action", None)
+        if toggle is not None:
+            try:
+                was_blocked = toggle.blockSignals(True)
+                toggle.setChecked(bool(visible))
+                toggle.blockSignals(was_blocked)
+            except Exception:
+                pass
+        # Show / hide the floating reveal button
+        if visible:
+            self._hide_sidebar_reveal_button()
+        else:
+            self._show_sidebar_reveal_button()
+
+    def _show_sidebar_reveal_button(self):
+        """Create (if needed) and show a floating reveal button on the main
+        window that brings the sidebar back."""
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        button = getattr(self, "_sidebar_reveal_button", None)
+        if button is None:
+            button = qt.QPushButton("▶", main_window)
+            button.setToolTip("Show the TrackVision sidebar")
+            button.setFixedSize(28, 64)
+            button.setStyleSheet(
+                "QPushButton {"
+                "  background: #1b2a44;"
+                "  color: #ffffff;"
+                "  border: 1px solid #3a7dde;"
+                "  border-top-left-radius: 8px;"
+                "  border-bottom-left-radius: 8px;"
+                "  border-top-right-radius: 0px;"
+                "  border-bottom-right-radius: 0px;"
+                "  font-size: 16px;"
+                "  font-weight: 700;"
+                "}"
+                "QPushButton:hover {"
+                "  background: #2a3a55;"
+                "}"
+            )
+            button.clicked.connect(lambda _checked=False: self._set_sidebar_visible(True))
+            # Keep it above child widgets
+            try:
+                button.raise_()
+            except Exception:
+                pass
+            # Install an event filter so we re-position the button on resize
+            main_window.installEventFilter(self._get_sidebar_reveal_event_filter())
+            self._sidebar_reveal_button = button
+        self._reposition_sidebar_reveal_button()
+        button.show()
+        try:
+            button.raise_()
+        except Exception:
+            pass
+
+    def _hide_sidebar_reveal_button(self):
+        button = getattr(self, "_sidebar_reveal_button", None)
+        if button is not None:
+            try:
+                button.hide()
+            except Exception:
+                pass
+
+    def _reposition_sidebar_reveal_button(self):
+        """Pin the reveal button to the right edge, vertically centered."""
+        main_window = slicer.util.mainWindow()
+        button = getattr(self, "_sidebar_reveal_button", None)
+        if main_window is None or button is None:
+            return
+        try:
+            mw_w = main_window.width
+            mw_h = main_window.height
+            btn_w = button.width
+            btn_h = button.height
+            button.move(int(mw_w - btn_w), int((mw_h - btn_h) / 2))
+        except Exception:
+            pass
+
+    def _get_sidebar_reveal_event_filter(self):
+        """Return a persistent Qt event filter that repositions the reveal
+        button when the main window is resized."""
+        existing = getattr(self, "_sidebar_reveal_filter", None)
+        if existing is not None:
+            return existing
+
+        class _ResizeFilter(qt.QObject):
+            def __init__(self, widget):
+                qt.QObject.__init__(self)
+                self._widget = widget
+
+            def eventFilter(self, obj, event):
+                try:
+                    if event.type() == qt.QEvent.Resize:
+                        self._widget._reposition_sidebar_reveal_button()
+                except Exception:
+                    pass
+                return False
+
+        flt = _ResizeFilter(self)
+        self._sidebar_reveal_filter = flt
+        return flt
+
+    def _install_sidebar_toggle(self):
+        """Add a toolbar button that hides/unhides the module panel (sidebar)."""
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+
+        panel_dock = slicer.util.findChild(main_window, "PanelDockWidget")
+        if panel_dock is None:
+            return
+
+        # Avoid adding the action twice on module re-entry
+        existing = getattr(self, "_sidebar_toggle_action", None)
+        if existing is not None:
+            return
+
+        settings_toolbar = getattr(self, "_toolbars", {}).get("SettingsToolBar")
+        if settings_toolbar is None:
+            settings_toolbar = slicer.util.findChild(main_window, "SettingsToolBar")
+        if settings_toolbar is None:
+            return
+
+        # Small helper labels so the toggle is self-explanatory
+        def _update_toggle_text(visible: bool):
+            if action is None:
+                return
+            if visible:
+                action.setText("Hide Sidebar")
+                action.setToolTip("Hide the TrackVision control sidebar")
+            else:
+                action.setText("Show Sidebar")
+                action.setToolTip("Show the TrackVision control sidebar")
+
+        # Build a checkable QAction so its pressed-state mirrors dock visibility
+        action = qt.QAction(main_window)
+        action.setCheckable(True)
+        action.setChecked(panel_dock.isVisible())
+        try:
+            action.setIcon(self._tinted_icon("Icons/Gears.png", "#ffffff"))
+        except Exception:
+            pass
+        _update_toggle_text(panel_dock.isVisible())
+        action.triggered.connect(lambda checked=False, d=panel_dock: d.setVisible(bool(checked)))
+
+        # Keep the button label in sync if the dock is hidden by Qt's own chrome
+        def _on_dock_visibility_changed(visible):
+            try:
+                was_blocked = action.blockSignals(True)
+                action.setChecked(bool(visible))
+                action.blockSignals(was_blocked)
+                _update_toggle_text(bool(visible))
+            except Exception:
+                pass
+
+        try:
+            panel_dock.visibilityChanged.connect(_on_dock_visibility_changed)
+        except Exception:
+            pass
+
+        settings_toolbar.addAction(action)
+        self._sidebar_toggle_action = action
+
+    def _move_module_panel_to_right(self):
+        """Keep Slicer's module panel docked on the right for the focused workflow layout."""
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+
+        panel_dock = slicer.util.findChild(main_window, "PanelDockWidget")
+        if panel_dock is None:
+            return
+
+        try:
+            panel_dock.setFloating(False)
+        except Exception:
+            pass
+
+        try:
+            main_window.addDockWidget(qt.Qt.RightDockWidgetArea, panel_dock)
+            panel_dock.show()
+        except Exception:
+            pass
+
+    def insertToolBar(self, beforeToolBarName: str, name: str, title: Optional[str] = None) -> qt.QToolBar:
+        """Helper method to insert a new toolbar between existing ones"""
+        beforeToolBar = slicer.util.findChild(slicer.util.mainWindow(), beforeToolBarName)
+
+        if title is None:
+            title = name
+
+        toolBar = qt.QToolBar(title)
+        toolBar.name = name
+        slicer.util.mainWindow().insertToolBar(beforeToolBar, toolBar)
+
+        self._toolbars[name] = toolBar
+
+        return toolBar
+
+    def initializeSettingsToolBar(self):
+        """Create toolbar and dialog for app settings"""
+        settingsToolBar = self.insertToolBar("MainToolBar", "SettingsToolBar", title="Settings")
+
+        gearIcon = self._tinted_icon("Icons/Gears.png", "#ffffff")
+        self.settingsAction = settingsToolBar.addAction(gearIcon, "")
+
+        # Settings dialog
+        self.settingsDialog = slicer.util.loadUI(self.resourcePath("UI/Settings.ui"))
+        self.settingsUI = slicer.util.childWidgetVariables(self.settingsDialog)
+        self.settingsAction.triggered.connect(self.raiseSettings)
+
+    def _tinted_icon(self, relative_path: str, color: str = "#ffffff") -> qt.QIcon:
+        """Return an icon tinted to a solid color while preserving source alpha."""
+        icon_path = self.resourcePath(relative_path)
+        pixmap = qt.QPixmap(icon_path)
+        if pixmap.isNull():
+            return qt.QIcon(icon_path)
+
+        try:
+            tinted = qt.QPixmap(pixmap.size())
+            tinted.fill(qt.Qt.transparent)
+            painter = qt.QPainter(tinted)
+            painter.drawPixmap(0, 0, pixmap)
+            painter.setCompositionMode(qt.QPainter.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), qt.QColor(color))
+            painter.end()
+            return qt.QIcon(tinted)
+        except Exception:
+            return qt.QIcon(icon_path)
+
+    def _create_settings_path_field(self, filters, tooltip: str) -> ctk.ctkPathLineEdit:
+        widget = ctk.ctkPathLineEdit()
+        widget.filters = filters
+        widget.showHistoryButton = False
+        widget.setToolTip(tooltip)
+        # Keep the selected path functional, but do not display path text in the UI.
+        try:
+            combo_box = widget.comboBox()
+            line_edit = combo_box.lineEdit() if combo_box is not None else None
+            if line_edit is not None:
+                line_edit.setReadOnly(True)
+                line_edit.setEchoMode(qt.QLineEdit.NoEcho)
+        except Exception:
+            pass
+        return widget
+
+    def _build_settings_dialog_controls(self):
+        if self.settingsUI is None:
+            return
+
+        session_panel = getattr(self.settingsUI, "SessionPanel", None)
+        session_layout = session_panel.layout() if session_panel is not None else None
+        if session_layout is None:
+            return
+
+        def add_section(title_text: str, description_text: str) -> qt.QFormLayout:
+            title = qt.QLabel(title_text)
+            title.setProperty("settingsSectionTitle", True)
+            session_layout.addWidget(title)
+
+            description = qt.QLabel(description_text)
+            description.setProperty("settingsHint", True)
+            description.wordWrap = True
+            session_layout.addWidget(description)
+
+            form = qt.QFormLayout()
+            form.setContentsMargins(0, 0, 0, 0)
+            form.setSpacing(10)
+            form.setLabelAlignment(qt.Qt.AlignLeft | qt.Qt.AlignVCenter)
+            session_layout.addLayout(form)
+            return form
+
+        study_form = add_section(
+            "Study and Model",
+            "These paths drive the import and registration actions shown on the Home panel.",
+        )
+
+        self._dicom_folder_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Dirs,
+            "Select a folder containing DICOM files (CT).",
+        )
+        self._needle_stl_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select needle STL to display and track.",
+        )
+        self._registration_matrix_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select registration matrix text file (4x4). Assumed Reference->CT.",
+        )
+
+        study_form.addRow("DICOM Study", self._dicom_folder_path)
+        study_form.addRow("Needle Model", self._needle_stl_path)
+        study_form.addRow("Registration", self._registration_matrix_path)
+
+        network_form = add_section(
+            "PLUS Connectivity",
+            "Configure the launcher endpoint, PLUS XML, and OpenIGTLink stream used during navigation.",
+        )
+
+        self._launcher_host = qt.QLineEdit()
+        self._launcher_host.setPlaceholderText("localhost")
+
+        self._launcher_port = qt.QSpinBox()
+        self._launcher_port.minimum = 1
+        self._launcher_port.maximum = 65535
+
+        self._plus_config_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select PLUS config XML (.plus.xml).",
+        )
+
+        self._igtl_host = qt.QLineEdit()
+        self._igtl_host.setPlaceholderText("localhost")
+
+        self._igtl_port = qt.QSpinBox()
+        self._igtl_port.minimum = 1
+        self._igtl_port.maximum = 65535
+
+        self._phantom_geometry_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select phantom geometry file (.ini).",
+        )
+        self._phantom_geometry_path.nameFilters = ["Geometry files (*.ini)", "All files (*)"]
+
+        self._tool_geometry_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select tool/pointer geometry file (.ini).",
+        )
+        self._tool_geometry_path.nameFilters = ["Geometry files (*.ini)", "All files (*)"]
+
+        self._plus_exe_path = self._create_settings_path_field(
+            ctk.ctkPathLineEdit.Files,
+            "Select PlusServer.exe path.",
+        )
+        self._plus_exe_path.nameFilters = ["PlusServer (PlusServer.exe)", "All files (*)"]
+
+        network_form.addRow("Phantom Geometry", self._phantom_geometry_path)
+        network_form.addRow("Tool Geometry", self._tool_geometry_path)
+        network_form.addRow("PlusServer.exe", self._plus_exe_path)
+        network_form.addRow("Launcher Host", self._launcher_host)
+        network_form.addRow("Launcher Port", self._launcher_port)
+        network_form.addRow("Config XML", self._plus_config_path)
+        network_form.addRow("IGTL Host", self._igtl_host)
+        network_form.addRow("IGTL Port", self._igtl_port)
+
+        transform_form = add_section(
+            "Transform Defaults",
+            "ReferenceToCT stores the static registration, and PointerToCT is the live tool transform used for visualization.",
+        )
+
+        self._ct_transform_name = qt.QLineEdit()
+        self._ct_transform_name.setPlaceholderText(_DEFAULT_REFERENCE_TO_CT_NAME)
+        self._needle_transform_name = qt.QLineEdit()
+        self._needle_transform_name.setPlaceholderText(_DEFAULT_POINTER_TO_CT_NAME)
+        self._invert_registration_matrix = qt.QCheckBox("Invert registration matrix before apply")
+        self._invert_registration_matrix.checked = False
+        self._invert_registration_matrix.setToolTip(
+            "Enable this only when the input matrix must be inverted before storing it as ReferenceToCT."
+        )
+
+        transform_form.addRow("ReferenceToCT name", self._ct_transform_name)
+        transform_form.addRow("PointerToCT name", self._needle_transform_name)
+        transform_form.addRow("", self._invert_registration_matrix)
+
+        footer = qt.QLabel("Settings are saved automatically while you edit them.")
+        footer.setProperty("settingsHint", True)
+        footer.wordWrap = True
+        session_layout.addWidget(footer)
+
+        self._dicom_folder_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._needle_stl_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._registration_matrix_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._phantom_geometry_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._tool_geometry_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._plus_exe_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._plus_config_path.currentPathChanged.connect(self._on_plus_config_path_changed)
+        self._plus_config_path.currentPathChanged.connect(self._on_settings_fields_changed)
+        self._launcher_host.textChanged.connect(self._on_settings_fields_changed)
+        self._launcher_port.valueChanged.connect(self._on_settings_fields_changed)
+        self._igtl_host.textChanged.connect(self._on_settings_fields_changed)
+        self._igtl_port.valueChanged.connect(self._on_settings_fields_changed)
+        self._ct_transform_name.textChanged.connect(self._on_settings_fields_changed)
+        self._needle_transform_name.textChanged.connect(self._on_settings_fields_changed)
+        self._invert_registration_matrix.toggled.connect(self._on_settings_fields_changed)
+
+    def toggleStyle(self, visible: bool):
+        if visible:
+            self.applyApplicationStyle()
+        else:
+            slicer.app.styleSheet = ""
+
+    def raiseSettings(self, _=None):
+        self._refresh_session_summary()
+        self.settingsDialog.exec()
+        self._refresh_session_summary()
+
+    def setCustomUIVisible(self, visible: bool):
+        self.setSlicerUIVisible(not visible)
+
+    def applyApplicationStyle(self):
+        SlicerCustomAppUtilities.applyStyle([slicer.app], self.resourcePath("Home.qss"))
+        self.styleThreeDWidget()
+        self.styleSliceWidgets()
+
+    def _apply_app_icon(self):
+        """Override the default Slicer application icon with the SpineTracker
+        branding at runtime (no C++ rebuild). Builds a multi-resolution QIcon
+        from the bundled spine_*.png files and applies it to the whole app and
+        the main window so it shows in the title bar, taskbar, and Alt-Tab."""
+        icon_files = [
+            "Icons/App/spine_16x16.png",
+            "Icons/App/spine_32x32.png",
+            "Icons/App/spine_64x63.png",
+            "Icons/App/spine_128x128.png",
+            "Icons/App/spine_465x605.png",
+        ]
+        app_icon = qt.QIcon()
+        added_any = False
+        for rel_path in icon_files:
+            try:
+                pixmap = qt.QPixmap(self.resourcePath(rel_path))
+            except Exception:
+                pixmap = qt.QPixmap()
+            if not pixmap.isNull():
+                app_icon.addPixmap(pixmap)
+                added_any = True
+        if not added_any:
+            logging.warning("SpineTracker app icon: no spine_*.png files found; keeping default icon.")
+            return
+        try:
+            qt.QApplication.setWindowIcon(app_icon)
+        except Exception:
+            pass
+        try:
+            main_window = slicer.util.mainWindow()
+            if main_window is not None:
+                main_window.setWindowIcon(app_icon)
+        except Exception:
+            logging.exception("Failed to set SpineTracker main-window icon")
+
+    def styleThreeDWidget(self):
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+
+        try:
+            three_d_widget = layout_manager.threeDWidget(0)
+        except Exception:
+            three_d_widget = None
+        if three_d_widget is None:
+            return
+
+        view_node = three_d_widget.mrmlViewNode()
+        if view_node is None:
+            return
+
+        # Make the 3D panel background black and keep direction cube/labels readable.
+        view_node.SetBackgroundColor(0.0, 0.0, 0.0)
+        view_node.SetBackgroundColor2(0.0, 0.0, 0.0)
+        view_node.SetBoxVisible(True)
+        try:
+            view_node.SetBoxColor(1.0, 1.0, 1.0)
+        except Exception:
+            pass
+        view_node.SetAxisLabelsVisible(True)
+
+        # Show a small orientation cube in the corner for direction awareness.
+        view_node.SetOrientationMarkerType(slicer.vtkMRMLAbstractViewNode.OrientationMarkerTypeCube)
+        view_node.SetOrientationMarkerSize(slicer.vtkMRMLAbstractViewNode.OrientationMarkerSizeSmall)
+
+    def styleSliceWidgets(self):
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+
+        for name in layout_manager.sliceViewNames():
+            slice_widget = layout_manager.sliceWidget(name)
+            self.styleSliceWidget(slice_widget)
+        _ensure_intersecting_slices_visible()
+
+    def styleSliceWidget(self, sliceWidget: slicer.qMRMLSliceWidget):
+        if sliceWidget is None:
+            return
+
+        try:
+            slice_node = sliceWidget.mrmlSliceNode()
+            if slice_node is not None:
+                _apply_custom_slice_layout_color(slice_node)
+                slice_node.SetBackgroundColor(0.0, 0.0, 0.0)
+                slice_node.SetBackgroundColor2(0.0, 0.0, 0.0)
+        except Exception:
+            pass
+
+        controller = sliceWidget.sliceController()
+        if controller is not None:
+            try:
+                controller.setVisible(True)
+            except Exception:
+                pass
+
+        vertical_controller = sliceWidget.sliceVerticalController()
+        if vertical_controller is not None:
+            try:
+                vertical_controller.setVisible(False)
+            except Exception:
+                pass
+
+        if controller is None:
+            return
+
+        # Keep offset readout/slider visible against dark controller bars.
+        offset_slider = slicer.util.findChild(controller, "SliceOffsetSlider")
+        if offset_slider is None:
+            return
+
+        try:
+            spin_box = offset_slider.spinBox()
+            if spin_box is not None:
+                spin_box.setStyleSheet(
+                    "color: #ffffff; background-color: #000000; border: 1px solid #ffffff; border-radius: 10px;"
+                )
+                # In some Slicer themes the internal line edit keeps its own palette,
+                # so style it directly to keep the mm text visible.
+                line_edit = None
+                try:
+                    if hasattr(spin_box, "lineEdit"):
+                        line_edit = spin_box.lineEdit()
+                except Exception:
+                    line_edit = None
+                if line_edit is None:
+                    try:
+                        line_edit = slicer.util.findChild(spin_box, "qt_spinbox_lineedit")
+                    except Exception:
+                        line_edit = None
+                if line_edit is not None:
+                    line_edit.setStyleSheet("color: #ffffff; background-color: #000000;")
+        except Exception:
+            pass
+
+
+class HomeLogic(ScriptedLoadableModuleLogic):
+    """
+    Implements underlying logic for the Home module.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._workflow: Optional[SpineTrackerWorkflow] = None
+        self._tracking_view_mode: str = "tool_centric"
+        self._smoothing_strength: float = _DEFAULT_SMOOTHING_STRENGTH
+        _ensure_automatic_pointer_to_ct_chain_started()
+
+    def _workflow_for_callbacks(
+        self,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ) -> SpineTrackerWorkflow:
+        if self._workflow is None:
+            self._workflow = SpineTrackerWorkflow(status_callback=status_callback, error_callback=error_callback)
+        else:
+            self._workflow._status = status_callback
+            self._workflow._error = error_callback
+        self._workflow.set_tracking_view_mode(self._tracking_view_mode)
+        self._workflow.set_smoothing_strength(self._smoothing_strength)
+        return self._workflow
+
+    def set_tracking_view_mode(self, mode: str):
+        normalized = _normalize_tracking_view_mode(mode)
+        self._tracking_view_mode = normalized
+        if self._workflow is not None:
+            try:
+                self._workflow.set_tracking_view_mode(normalized)
+            except Exception:
+                pass
+
+    def set_smoothing_strength(self, strength: float):
+        try:
+            value = float(strength)
+        except (TypeError, ValueError):
+            return
+        self._smoothing_strength = value
+        if self._workflow is not None:
+            try:
+                self._workflow.set_smoothing_strength(value)
+            except Exception:
+                pass
+        # The always-on background PointerToCT chain also drives the displayed
+        # tool, so keep its smoothing in sync with the workflow's.
+        try:
+            _automatic_pointer_to_ct_chain().set_smoothing_strength(value)
+        except Exception:
+            pass
+
+    def start(
+        self,
+        params: WorkflowParams,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        workflow.start(params)
+
+    def apply_registration(
+        self,
+        matrix_path: str,
+        invert: bool,
+        ct_transform_name: str,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        try:
+            workflow.apply_registration(matrix_path=matrix_path, invert=invert, ct_transform_name=ct_transform_name)
+        except Exception as exc:
+            status_callback("registration", _StatusState.ERR, f"Registration: {exc}")
+            error_callback(str(exc))
+
+    def apply_registration_text(
+        self,
+        matrix_text: str,
+        invert: bool,
+        ct_transform_name: str,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        try:
+            workflow.apply_registration_text(
+                matrix_text=matrix_text,
+                invert=invert,
+                ct_transform_name=ct_transform_name,
+            )
+        except Exception as exc:
+            status_callback("registration", _StatusState.ERR, f"Registration: {exc}")
+            error_callback(str(exc))
+
+    def load_ct(
+        self,
+        dicom_folder: str,
+        ct_transform_name: str,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        try:
+            workflow.load_ct(dicom_folder=dicom_folder, ct_transform_name=ct_transform_name)
+        except Exception as exc:
+            status_callback("ct", _StatusState.ERR, f"CT: {exc}")
+            status_callback("vr", _StatusState.ERR, "Volume rendering: error")
+            error_callback(str(exc))
+
+    def load_needle(
+        self,
+        needle_path: str,
+        needle_transform_name: str,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        try:
+            workflow.load_needle(needle_path=needle_path, needle_transform_name=needle_transform_name)
+        except Exception as exc:
+            status_callback("needle", _StatusState.ERR, f"Needle: {exc}")
+            error_callback(str(exc))
+
+    def initialize_tracking(
+        self,
+        igtl_host: str,
+        igtl_port: int,
+        ct_transform_name: str,
+        needle_transform_name: str,
+        expected_transform_names: Optional[list[str]],
+        launcher_host: Optional[str],
+        launcher_port: Optional[int],
+        plus_config_path: str,
+        status_callback: Callable[[str, str, str], None],
+        error_callback: Callable[[str], None],
+        plus_exe_path: str = "",
+        phantom_geometry_path: str = "",
+        tool_geometry_path: str = "",
+    ):
+        workflow = self._workflow_for_callbacks(status_callback=status_callback, error_callback=error_callback)
+        try:
+            workflow.initialize_tracking(
+                igtl_host=igtl_host,
+                igtl_port=int(igtl_port),
+                ct_transform_name=ct_transform_name,
+                needle_transform_name=needle_transform_name,
+                expected_transform_names=expected_transform_names or None,
+                launcher_host=launcher_host,
+                launcher_port=int(launcher_port) if launcher_port is not None else None,
+                plus_config_path=plus_config_path,
+                plus_exe_path=plus_exe_path,
+                phantom_geometry_path=phantom_geometry_path,
+                tool_geometry_path=tool_geometry_path,
+            )
+            return True
+        except Exception as exc:
+            status_callback("launcher", _StatusState.ERR, f"IGTL: {exc}")
+            error_callback(str(exc))
+            return False
+
+    def stop(self):
+        if self._workflow is not None:
+            self._workflow.stop()

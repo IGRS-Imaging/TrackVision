@@ -1,0 +1,569 @@
+/* SpineTracker2 - Legacy HTIC Workflow Theme */
+
+QWidget {
+  background-color: #000000;
+  color: #ffffff;
+  font-family: "Segoe UI", "Bahnschrift", sans-serif;
+  font-size: 15px;
+  selection-background-color: #4da3ff;
+  selection-color: #08101a;
+  widget-animation-duration: 180;
+}
+
+QWidget:disabled {
+  color: #6e84a6;
+}
+
+QMainWindow {
+  background-color: #000000;
+}
+
+QWidget#SpineTrackerWorkflowRoot,
+QScrollArea,
+QScrollArea > QWidget > QWidget {
+  background: #000000;
+}
+
+QFrame#PanelDockWidget,
+QFrame#PanelDockWidget > QWidget,
+QToolBar {
+  background: #000000;
+  border: none;
+}
+
+QToolBar QToolButton {
+  min-width: 28px;
+}
+
+QFrame#LegacyHeroCard,
+QFrame#LegacyCard,
+QFrame[card="true"],
+QFrame#SettingsPanel {
+  background: #020202;
+  border: 1px solid #ffffff;
+  border-radius: 22px;
+}
+
+QFrame#LegacyCardFlat {
+  background: transparent;
+  border: none;
+  border-radius: 0px;
+}
+
+QDialog#AdditionalSettingsDialog {
+  background: #0c1a31;
+  border: 1px solid #2e5d96;
+  border-radius: 16px;
+}
+
+QLabel#AdditionalSettingsTitle {
+  background: #0a1730;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+
+QDialog#OperationProgressDialog {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 16px;
+}
+
+QLabel#OperationProgressTitle {
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+QProgressBar#OperationProgressBar {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 8px;
+  color: #ffffff;
+  min-height: 18px;
+  text-align: center;
+}
+
+QProgressBar#OperationProgressBar::chunk {
+  background: #4da3ff;
+  border-radius: 6px;
+}
+
+QFrame#LegacyHeroPanel {
+  background: #08162c;
+  border: none;
+  border-radius: 18px;
+}
+
+QLabel[legacyEyebrow="true"] {
+  color: #9bc9ff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+QLabel#LegacyHeroTitle {
+  color: #ffffff;
+  font-size: 30px;
+  font-weight: 700;
+}
+
+QLabel#LegacyHeroSubtitle {
+  color: #dbe9ff;
+  font-size: 14px;
+}
+
+QLabel[legacyChip="true"] {
+  background: #113f76;
+  border: 1px solid #4da3ff;
+  border-radius: 14px;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+QPushButton#LegacyWorkspaceButton {
+  background: #1d5fbf;
+  border: 1px solid #4da3ff;
+  border-radius: 14px;
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+QPushButton#LegacyWorkspaceButton:hover {
+  border-color: #b7d7ff;
+}
+
+QFrame#LegacyLogoCard {
+  background: #122543;
+  border: 1px solid #2e5d96;
+  border-radius: 18px;
+}
+
+QLabel[legacyLogo="true"] {
+  background: transparent;
+}
+
+QLabel#LegacyLogoText {
+  color: #9bc9ff;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+QLabel[legacyCardTitle="true"] {
+  background: #0a1730;
+  color: #ffffff;
+  font-size: 17px;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+
+QLabel[legacyCardDescription="true"],
+QLabel[pageHint="true"],
+QLabel#SettingsSubtitle {
+  color: #c2d7f3;
+  font-size: 14px;
+}
+
+QLabel#SettingsTitle {
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+QWidget[legacyRow="true"] {
+  background: transparent;
+}
+
+QLabel[legacyFieldLabel="true"] {
+  background: #000000;
+  color: #ffffff;
+  border: 1px solid #ffffff;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px 10px;
+}
+
+QLabel[windowLevelLabel="true"] {
+  background: transparent;
+  color: #ffffff;
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 0px;
+}
+
+QLineEdit,
+QSpinBox,
+QDoubleSpinBox,
+QComboBox,
+ctkPathLineEdit {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 14px;
+  color: #ffffff;
+  min-height: 34px;
+  padding: 8px 12px;
+}
+
+QLineEdit:focus,
+QSpinBox:focus,
+QDoubleSpinBox:focus,
+QComboBox:focus,
+ctkPathLineEdit:focus {
+  border-color: #bfe0ff;
+}
+
+/* Hide selected source paths in Home cards while keeping picker controls usable. */
+ctkPathLineEdit QComboBox,
+ctkPathLineEdit QLineEdit {
+  color: transparent;
+  selection-color: transparent;
+}
+
+/* White offset sliders in slice controller bars (R/G/Y windows). */
+qMRMLSliderWidget#SliceOffsetSlider QSlider::groove:horizontal {
+  height: 3px;
+  background: #d7e2e2;
+  border-radius: 2px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::sub-page:horizontal,
+qMRMLSliderWidget#SliceOffsetSlider QSlider::add-page:horizontal {
+  background: #ffffff;
+  border-radius: 2px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::handle:horizontal {
+  background: #ffffff;
+  border: 1px solid #dfe7f2;
+  width: 10px;
+  margin: -5px 0;
+  border-radius: 5px;
+}
+
+/* Keep slice-controller strip dark; only controls inside are white. */
+QWidget#BarWidget {
+  background: #000000;
+  border: 1px solid #ffffff;
+}
+
+QWidget#BarWidget QToolButton {
+  background: #ffffff;
+  border: 1px solid #dfe7f2;
+  border-radius: 10px;
+  color: #0c1320;
+}
+
+QWidget#BarWidget QToolButton:hover {
+  border-color: #9fb7d1;
+}
+
+QWidget#BarWidget QToolButton:disabled {
+  background: #f6f8fb;
+  border-color: #e1e7f0;
+  color: #78879d;
+}
+
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider QDoubleSpinBox,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider ctkDoubleSpinBox,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider QLineEdit {
+  background: #000000;
+  color: #ffffff;
+  border: 1px solid #ffffff;
+  border-radius: 10px;
+}
+
+QWidget#BarWidget QLabel,
+QWidget#BarWidget QAbstractSpinBox,
+QWidget#BarWidget QAbstractSpinBox QLineEdit {
+  color: #ffffff;
+}
+
+QWidget#BarWidget QLineEdit {
+  color: #ffffff;
+}
+
+QPushButton,
+QToolButton {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 14px;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+QPushButton:hover,
+QToolButton:hover {
+  background: #121212;
+  border-color: #ffffff;
+}
+
+QPushButton:pressed,
+QToolButton:pressed {
+  background: #1e1e1e;
+}
+
+QPushButton:disabled,
+QToolButton:disabled {
+  background: #080808;
+  border-color: #3f3f3f;
+  color: #8f8f8f;
+}
+
+QPushButton#LegacyActionButton,
+QPushButton#LegacySecondaryButton,
+QPushButton#PrimaryButton {
+  min-height: 38px;
+  min-width: 96px;
+}
+
+QPushButton#PrimaryButton {
+  background: #000000;
+  border: 1px solid #ffffff;
+}
+
+QPushButton#WorkflowButton[runtimeState="wait"],
+QPushButton#UtilityButton[runtimeState="wait"],
+QPushButton#SecondaryButton[runtimeState="wait"],
+QPushButton#PrimaryButton[runtimeState="wait"],
+QPushButton#LegacyActionButton[runtimeState="wait"],
+QPushButton#LegacySecondaryButton[runtimeState="wait"] {
+  border-color: #ffffff;
+  color: #ffffff;
+}
+
+QPushButton#WorkflowButton[runtimeState="ok"],
+QPushButton#UtilityButton[runtimeState="ok"],
+QPushButton#SecondaryButton[runtimeState="ok"],
+QPushButton#PrimaryButton[runtimeState="ok"],
+QPushButton#LegacyActionButton[runtimeState="ok"],
+QPushButton#LegacySecondaryButton[runtimeState="ok"] {
+  border-color: #ffffff;
+  color: #ffffff;
+}
+
+QPushButton#WorkflowButton[runtimeState="err"],
+QPushButton#UtilityButton[runtimeState="err"],
+QPushButton#SecondaryButton[runtimeState="err"],
+QPushButton#PrimaryButton[runtimeState="err"],
+QPushButton#LegacyActionButton[runtimeState="err"],
+QPushButton#LegacySecondaryButton[runtimeState="err"] {
+  border-color: #ffffff;
+  color: #ffffff;
+}
+
+QPushButton#WorkflowButton[runtimeState="active"],
+QPushButton#UtilityButton[runtimeState="active"],
+QPushButton#SecondaryButton[runtimeState="active"],
+QPushButton#PrimaryButton[runtimeState="active"],
+QPushButton#LegacyActionButton[runtimeState="active"],
+QPushButton#LegacySecondaryButton[runtimeState="active"] {
+  background: #1e1e1e;
+  border-color: #ffffff;
+  color: #ffffff;
+}
+
+QFrame#TrackingModeSwitch {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 18px;
+}
+
+QFrame#TrackingModeHighlight {
+  background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #4aa4ff, stop: 1 #2d72d2);
+  border: 1px solid #c4e2ff;
+  border-radius: 14px;
+}
+
+QPushButton#TrackingModeButton {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 14px;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  min-height: 38px;
+}
+
+QPushButton#TrackingModeButton:hover {
+  background: #121212;
+  color: #ffffff;
+}
+
+QPushButton#TrackingModeButton:checked,
+QPushButton#TrackingModeButton[trackingSelected="true"] {
+  background: #5b9bd5;
+  border: 2px solid #5b9bd5;
+  color: #ffffff;
+}
+
+QPushButton#TrackingModeButton:checked:hover,
+QPushButton#TrackingModeButton[trackingSelected="true"]:hover {
+  background: #6aa6dd;
+  border: 2px solid #6aa6dd;
+  color: #ffffff;
+}
+
+QFrame#ModeSwitcher {
+  background: transparent;
+  border: none;
+}
+
+QPushButton#ModeButton {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 14px;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  min-height: 42px;
+  padding: 10px 14px;
+}
+
+QPushButton#ModeButton:hover {
+  background: #121212;
+  border-color: #ffffff;
+}
+
+QPushButton#ModeButton:checked {
+  background: #5b9bd5;
+  border: 1px solid #5b9bd5;
+  color: #ffffff;
+}
+
+QPushButton#ModeButton:checked:hover {
+  background: #6aa6dd;
+  border: 1px solid #6aa6dd;
+}
+
+QPushButton[additionalSettingsButton="true"] {
+  text-align: center;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+QFrame[trackingAccuracyCard="true"] {
+  background: #000000;
+  border: 1px solid #ffffff;
+  border-radius: 14px;
+}
+
+QLabel[trackingAccuracyTitle="true"] {
+  background: transparent;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+QLabel[trackingAccuracyValue="true"] {
+  background: transparent;
+  color: #ffffff;
+  font-size: 14px;
+}
+
+QLabel[trackingAccuracyHint="true"] {
+  background: transparent;
+  color: #d8d8d8;
+  font-size: 13px;
+}
+
+QCheckBox {
+  color: #eff6ff;
+  spacing: 8px;
+}
+
+QCheckBox::indicator {
+  width: 16px;
+  height: 16px;
+  border: 1px solid #3f6ea8;
+  border-radius: 4px;
+  background: #0a1730;
+}
+
+QCheckBox::indicator:checked {
+  background: #4da3ff;
+  border-color: #4da3ff;
+}
+
+QProgressBar#BusyIndicator {
+  background: #0a1730;
+  border: 1px solid #2e5d96;
+  border-radius: 4px;
+}
+
+QProgressBar#BusyIndicator::chunk {
+  background: #4da3ff;
+  border-radius: 4px;
+}
+
+QFrame[statusRow="true"],
+QFrame[statusTile="true"] {
+  background: #0a1730;
+  border: 1px solid #274973;
+  border-radius: 14px;
+}
+
+QLabel[statusName="true"] {
+  color: #9bc9ff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+QFrame[statusRow="true"] QLabel[status="ok"],
+QFrame[statusRow="true"] QLabel[status="wait"],
+QFrame[statusRow="true"] QLabel[status="err"],
+QFrame[statusTile="true"] QLabel[status="ok"],
+QFrame[statusTile="true"] QLabel[status="wait"],
+QFrame[statusTile="true"] QLabel[status="err"] {
+  font-size: 13px;
+}
+
+QLabel[statusDot="true"] {
+  background: #6e8bb5;
+  border-radius: 5px;
+}
+
+QLabel[status="ok"] {
+  color: #8ff8b7;
+}
+
+QLabel[status="wait"] {
+  color: #b7d7ff;
+}
+
+QLabel[status="err"] {
+  color: #ff9b9b;
+}
+
+QLabel[statusDot="true"][status="ok"] {
+  background: #40c463;
+}
+
+QLabel[statusDot="true"][status="wait"] {
+  background: #4da3ff;
+}
+
+QLabel[statusDot="true"][status="err"] {
+  background: #ef5350;
+}
+
+QLabel[errorText="true"] {
+  color: #ff8b8b;
+  font-weight: 600;
+}
+
+QDialog#Dialog {
+  background: #0b1a31;
+  color: #f3f7ff;
+}
+
+QDialogButtonBox QPushButton {
+  min-width: 100px;
+}

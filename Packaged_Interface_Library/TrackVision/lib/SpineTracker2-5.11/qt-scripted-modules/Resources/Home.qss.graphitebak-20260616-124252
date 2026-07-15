@@ -1,0 +1,827 @@
+/* SpineTracker2 - Graphite Dark Theme
+ *
+ * Professional dark theme for surgical navigation / medical imaging.
+ * Image viewports stay pure black; surrounding chrome is muted graphite so the
+ * medical images remain the focus. A single blue accent (#4d8eff) marks active,
+ * selected and interactive elements.
+ *
+ * Palette
+ *   app bg          #1e1f22
+ *   panel/sidebar   #26282d
+ *   control/input   #2d2f34
+ *   hover           #34373e
+ *   border/pressed  #3a3d44
+ *   border-strong   #4a4e57
+ *   text            #e4e6eb
+ *   text-muted      #a8adb8
+ *   text-disabled   #6b7280
+ *   icon            #cfd3da
+ *   accent          #4d8eff   (hover #6aa1ff / pressed #3c7ae0)
+ *   accent-fill     #243a5e   (selected backgrounds)
+ *   on-accent       #0d1015
+ *   ok/warn/err     #3fb950 / #d8a23a / #f0564a
+ */
+
+QWidget {
+  background-color: #1e1f22;
+  color: #e4e6eb;
+  font-family: "Segoe UI", "Bahnschrift", sans-serif;
+  font-size: 13px;
+  selection-background-color: #4d8eff;
+  selection-color: #0d1015;
+  widget-animation-duration: 180;
+}
+
+QWidget:disabled {
+  color: #6b7280;
+}
+
+QMainWindow {
+  background-color: #1e1f22;
+}
+
+QWidget#SpineTrackerWorkflowRoot,
+QScrollArea,
+QScrollArea > QWidget > QWidget {
+  background: #1e1f22;
+}
+
+QFrame#PanelDockWidget,
+QFrame#PanelDockWidget > QWidget,
+QToolBar {
+  background: #1e1f22;
+  border: none;
+}
+
+QToolBar QToolButton {
+  min-width: 28px;
+}
+
+/* ---- Cards / panels ---- */
+QFrame#LegacyHeroCard,
+QFrame#LegacyCard,
+QFrame[card="true"],
+QFrame#SettingsPanel {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 16px;
+}
+
+QFrame#LegacyCardFlat {
+  background: transparent;
+  border: none;
+  border-radius: 0px;
+}
+
+QDialog#AdditionalSettingsDialog {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 16px;
+}
+
+QLabel#AdditionalSettingsTitle {
+  background: transparent;
+  color: #e4e6eb;
+  font-size: 16px;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+
+QDialog#OperationProgressDialog {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 16px;
+}
+
+QLabel#OperationProgressTitle {
+  color: #e4e6eb;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+QProgressBar#OperationProgressBar {
+  background: #2d2f34;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  color: #e4e6eb;
+  min-height: 18px;
+  text-align: center;
+}
+
+QProgressBar#OperationProgressBar::chunk {
+  background: #4d8eff;
+  border-radius: 6px;
+}
+
+QFrame#LegacyHeroPanel {
+  background: #26282d;
+  border: none;
+  border-radius: 16px;
+}
+
+QLabel[legacyEyebrow="true"] {
+  color: #4d8eff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+QLabel#LegacyHeroTitle {
+  color: #e4e6eb;
+  font-size: 30px;
+  font-weight: 700;
+}
+
+QLabel#LegacyHeroSubtitle {
+  color: #a8adb8;
+  font-size: 14px;
+}
+
+QLabel[legacyChip="true"] {
+  background: #243a5e;
+  border: 1px solid #4d8eff;
+  border-radius: 12px;
+  color: #e4e6eb;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+QPushButton#LegacyWorkspaceButton {
+  background: #4d8eff;
+  border: 1px solid #4d8eff;
+  border-radius: 12px;
+  color: #0d1015;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+QPushButton#LegacyWorkspaceButton:hover {
+  background: #6aa1ff;
+  border-color: #6aa1ff;
+}
+
+QPushButton#LegacyWorkspaceButton:pressed {
+  background: #3c7ae0;
+  border-color: #3c7ae0;
+}
+
+QFrame#LegacyLogoCard {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 16px;
+}
+
+QLabel[legacyLogo="true"] {
+  background: transparent;
+}
+
+QLabel#LegacyLogoText {
+  color: #a8adb8;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+QLabel[legacyCardTitle="true"] {
+  background: transparent;
+  color: #e4e6eb;
+  font-size: 17px;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+
+QLabel[legacyCardDescription="true"],
+QLabel[pageHint="true"],
+QLabel#SettingsSubtitle {
+  color: #a8adb8;
+  font-size: 12px;
+}
+
+QLabel#SettingsTitle {
+  color: #e4e6eb;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+QWidget[legacyRow="true"] {
+  background: transparent;
+}
+
+/* Field labels read as quiet captions, not boxed white chips. */
+QLabel[legacyFieldLabel="true"] {
+  background: transparent;
+  color: #a8adb8;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 12px 10px;
+}
+
+QLabel[windowLevelLabel="true"] {
+  background: transparent;
+  color: #e4e6eb;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0px;
+}
+
+/* ---- Inputs ---- */
+QLineEdit,
+QSpinBox,
+QDoubleSpinBox,
+QComboBox,
+ctkPathLineEdit {
+  background: #2d2f34;
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  color: #e4e6eb;
+  min-height: 34px;
+  padding: 8px 12px;
+}
+
+QLineEdit:focus,
+QSpinBox:focus,
+QDoubleSpinBox:focus,
+QComboBox:focus,
+ctkPathLineEdit:focus {
+  border-color: #4d8eff;
+}
+
+QLineEdit:disabled,
+QSpinBox:disabled,
+QDoubleSpinBox:disabled,
+QComboBox:disabled,
+ctkPathLineEdit:disabled {
+  background: #26282d;
+  border-color: #2d2f34;
+  color: #6b7280;
+}
+
+QComboBox::drop-down {
+  border: none;
+  width: 22px;
+}
+
+QComboBox QAbstractItemView {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  color: #e4e6eb;
+  selection-background-color: #243a5e;
+  selection-color: #e4e6eb;
+  outline: none;
+}
+
+/* Hide selected source paths in Home cards while keeping picker controls usable. */
+ctkPathLineEdit QComboBox,
+ctkPathLineEdit QLineEdit {
+  color: transparent;
+  selection-color: transparent;
+}
+
+/* ---- Slice offset slider (R/G/Y windows) ---- */
+qMRMLSliderWidget#SliceOffsetSlider QSlider::groove:horizontal {
+  height: 3px;
+  background: #3a3d44;
+  border-radius: 2px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::sub-page:horizontal {
+  background: #4d8eff;
+  border-radius: 2px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::add-page:horizontal {
+  background: #3a3d44;
+  border-radius: 2px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::handle:horizontal {
+  background: #e4e6eb;
+  border: 1px solid #4a4e57;
+  width: 12px;
+  margin: -5px 0;
+  border-radius: 6px;
+}
+
+qMRMLSliderWidget#SliceOffsetSlider QSlider::handle:horizontal:hover {
+  background: #ffffff;
+  border-color: #4d8eff;
+}
+
+/* Generic sliders elsewhere inherit the same restrained look. */
+QSlider::groove:horizontal {
+  height: 3px;
+  background: #3a3d44;
+  border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+  background: #4d8eff;
+  border-radius: 2px;
+}
+
+QSlider::add-page:horizontal {
+  background: #3a3d44;
+  border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+  background: #e4e6eb;
+  border: 1px solid #4a4e57;
+  width: 12px;
+  margin: -5px 0;
+  border-radius: 6px;
+}
+
+QSlider::handle:horizontal:hover {
+  border-color: #4d8eff;
+}
+
+/* ---- Slice controller strip (toolbar above/below each 2D slice) ----
+ * Muted graphite strip with borderless, transparent controls so the bar
+ * recedes against the black image. */
+QWidget#BarWidget {
+  background: #26282d;
+  border: none;
+}
+
+QWidget#BarWidget QToolButton {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #cfd3da;
+  padding: 3px;
+}
+
+QWidget#BarWidget QToolButton:hover {
+  background: #34373e;
+  border-color: #4a4e57;
+}
+
+QWidget#BarWidget QToolButton:pressed {
+  background: #3a3d44;
+}
+
+QWidget#BarWidget QToolButton:checked {
+  background: #243a5e;
+  border-color: #4d8eff;
+  color: #e4e6eb;
+}
+
+QWidget#BarWidget QToolButton:disabled {
+  background: transparent;
+  border-color: transparent;
+  color: #6b7280;
+}
+
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider QDoubleSpinBox,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider ctkDoubleSpinBox,
+QWidget#BarWidget qMRMLSliderWidget#SliceOffsetSlider QLineEdit {
+  background: #2d2f34;
+  color: #e4e6eb;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+}
+
+QWidget#BarWidget QLabel,
+QWidget#BarWidget QAbstractSpinBox,
+QWidget#BarWidget QAbstractSpinBox QLineEdit {
+  color: #e4e6eb;
+}
+
+QWidget#BarWidget QLineEdit {
+  color: #e4e6eb;
+}
+
+/* ---- Buttons (neutral by default; accent reserved for primary/active) ---- */
+QPushButton,
+QToolButton {
+  background: #2d2f34;
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  color: #e4e6eb;
+  font-weight: 600;
+  padding: 10px 14px;
+}
+
+QPushButton:hover,
+QToolButton:hover {
+  background: #34373e;
+  border-color: #4a4e57;
+}
+
+QPushButton:pressed,
+QToolButton:pressed {
+  background: #3a3d44;
+}
+
+QPushButton:disabled,
+QToolButton:disabled {
+  background: #26282d;
+  border-color: #2d2f34;
+  color: #6b7280;
+}
+
+QPushButton#LegacyActionButton,
+QPushButton#LegacySecondaryButton,
+QPushButton#PrimaryButton {
+  min-height: 38px;
+  min-width: 96px;
+}
+
+QPushButton#PrimaryButton {
+  background: #4d8eff;
+  border: 1px solid #4d8eff;
+  color: #0d1015;
+  font-weight: 700;
+}
+
+QPushButton#PrimaryButton:hover {
+  background: #6aa1ff;
+  border-color: #6aa1ff;
+}
+
+QPushButton#PrimaryButton:pressed {
+  background: #3c7ae0;
+  border-color: #3c7ae0;
+}
+
+QPushButton#PrimaryButton:disabled {
+  background: #2d2f34;
+  border-color: #2d2f34;
+  color: #6b7280;
+}
+
+/* Runtime status outlines on action buttons. */
+QPushButton#WorkflowButton[runtimeState="wait"],
+QPushButton#UtilityButton[runtimeState="wait"],
+QPushButton#SecondaryButton[runtimeState="wait"],
+QPushButton#PrimaryButton[runtimeState="wait"],
+QPushButton#LegacyActionButton[runtimeState="wait"],
+QPushButton#LegacySecondaryButton[runtimeState="wait"] {
+  border-color: #4d8eff;
+  color: #e4e6eb;
+}
+
+QPushButton#WorkflowButton[runtimeState="ok"],
+QPushButton#UtilityButton[runtimeState="ok"],
+QPushButton#SecondaryButton[runtimeState="ok"],
+QPushButton#PrimaryButton[runtimeState="ok"],
+QPushButton#LegacyActionButton[runtimeState="ok"],
+QPushButton#LegacySecondaryButton[runtimeState="ok"] {
+  border-color: #3fb950;
+  color: #e4e6eb;
+}
+
+QPushButton#WorkflowButton[runtimeState="err"],
+QPushButton#UtilityButton[runtimeState="err"],
+QPushButton#SecondaryButton[runtimeState="err"],
+QPushButton#PrimaryButton[runtimeState="err"],
+QPushButton#LegacyActionButton[runtimeState="err"],
+QPushButton#LegacySecondaryButton[runtimeState="err"] {
+  border-color: #f0564a;
+  color: #e4e6eb;
+}
+
+QPushButton#WorkflowButton[runtimeState="active"],
+QPushButton#UtilityButton[runtimeState="active"],
+QPushButton#SecondaryButton[runtimeState="active"],
+QPushButton#PrimaryButton[runtimeState="active"],
+QPushButton#LegacyActionButton[runtimeState="active"],
+QPushButton#LegacySecondaryButton[runtimeState="active"] {
+  background: #243a5e;
+  border-color: #4d8eff;
+  color: #e4e6eb;
+}
+
+/* ---- Tracking mode segmented switch ---- */
+QFrame#TrackingModeSwitch {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 14px;
+}
+
+QFrame#TrackingModeHighlight {
+  background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #4d8eff, stop: 1 #3c7ae0);
+  border: 1px solid #6aa1ff;
+  border-radius: 12px;
+}
+
+QPushButton#TrackingModeButton {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: #e4e6eb;
+  font-weight: 700;
+  min-height: 34px;
+}
+
+QPushButton#TrackingModeButton:hover {
+  background: #34373e;
+  color: #e4e6eb;
+}
+
+QPushButton#TrackingModeButton:checked,
+QPushButton#TrackingModeButton[trackingSelected="true"] {
+  background: #4d8eff;
+  border: 1px solid #4d8eff;
+  color: #0d1015;
+}
+
+QPushButton#TrackingModeButton:checked:hover,
+QPushButton#TrackingModeButton[trackingSelected="true"]:hover {
+  background: #6aa1ff;
+  border: 1px solid #6aa1ff;
+  color: #0d1015;
+}
+
+QPushButton[additionalSettingsButton="true"] {
+  text-align: center;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* ---- Tracking accuracy card ---- */
+QFrame[trackingAccuracyCard="true"] {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 12px;
+}
+
+QLabel[trackingAccuracyTitle="true"] {
+  background: transparent;
+  color: #e4e6eb;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+QLabel[trackingAccuracyValue="true"] {
+  background: transparent;
+  color: #a8adb8;
+  font-size: 12px;
+}
+
+QLabel[trackingAccuracyHint="true"] {
+  background: transparent;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+/* ---- Checkboxes ---- */
+QCheckBox {
+  color: #e4e6eb;
+  spacing: 8px;
+}
+
+QCheckBox::indicator {
+  width: 16px;
+  height: 16px;
+  border: 1px solid #4a4e57;
+  border-radius: 4px;
+  background: #2d2f34;
+}
+
+QCheckBox::indicator:hover {
+  border-color: #4d8eff;
+}
+
+QCheckBox::indicator:checked {
+  background: #4d8eff;
+  border-color: #4d8eff;
+}
+
+/* ---- Busy / status ---- */
+QProgressBar#BusyIndicator {
+  background: #2d2f34;
+  border: 1px solid #3a3d44;
+  border-radius: 4px;
+}
+
+QProgressBar#BusyIndicator::chunk {
+  background: #4d8eff;
+  border-radius: 4px;
+}
+
+QFrame[statusRow="true"],
+QFrame[statusTile="true"] {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 12px;
+}
+
+QLabel[statusName="true"] {
+  color: #a8adb8;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+QFrame[statusRow="true"] QLabel[status="ok"],
+QFrame[statusRow="true"] QLabel[status="wait"],
+QFrame[statusRow="true"] QLabel[status="err"],
+QFrame[statusTile="true"] QLabel[status="ok"],
+QFrame[statusTile="true"] QLabel[status="wait"],
+QFrame[statusTile="true"] QLabel[status="err"] {
+  font-size: 11px;
+}
+
+QLabel[statusDot="true"] {
+  background: #6b7280;
+  border-radius: 5px;
+}
+
+QLabel[status="ok"] {
+  color: #5ddca5;
+}
+
+QLabel[status="wait"] {
+  color: #7fb0ff;
+}
+
+QLabel[status="err"] {
+  color: #ff8a8a;
+}
+
+QLabel[statusDot="true"][status="ok"] {
+  background: #3fb950;
+}
+
+QLabel[statusDot="true"][status="wait"] {
+  background: #4d8eff;
+}
+
+QLabel[statusDot="true"][status="err"] {
+  background: #f0564a;
+}
+
+QLabel[errorText="true"] {
+  color: #ff8a8a;
+  font-weight: 600;
+}
+
+/* ---- Dialogs ---- */
+QDialog#Dialog {
+  background: #26282d;
+  color: #e4e6eb;
+}
+
+QDialogButtonBox QPushButton {
+  min-width: 100px;
+}
+
+/* ---- Lists / trees / tables ---- */
+QListView,
+QTreeView,
+QTableView,
+QListWidget,
+QTreeWidget {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  color: #e4e6eb;
+  alternate-background-color: #2a2c31;
+  outline: none;
+}
+
+QListView::item:selected,
+QTreeView::item:selected,
+QTableView::item:selected,
+QListWidget::item:selected,
+QTreeWidget::item:selected {
+  background: #243a5e;
+  color: #e4e6eb;
+}
+
+QListView::item:hover,
+QTreeView::item:hover,
+QListWidget::item:hover,
+QTreeWidget::item:hover {
+  background: #34373e;
+}
+
+QHeaderView::section {
+  background: #2d2f34;
+  color: #a8adb8;
+  border: none;
+  border-bottom: 1px solid #3a3d44;
+  padding: 6px 8px;
+}
+
+/* ---- Tabs ---- */
+QTabWidget::pane {
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  background: #26282d;
+}
+
+QTabBar::tab {
+  background: transparent;
+  color: #a8adb8;
+  padding: 8px 14px;
+  border: none;
+}
+
+QTabBar::tab:selected {
+  color: #e4e6eb;
+  border-bottom: 2px solid #4d8eff;
+}
+
+QTabBar::tab:hover {
+  color: #e4e6eb;
+}
+
+/* ---- Group boxes ---- */
+QGroupBox {
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  margin-top: 10px;
+  color: #e4e6eb;
+}
+
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 10px;
+  padding: 0 4px;
+  color: #a8adb8;
+}
+
+/* ---- Scrollbars ---- */
+QScrollBar:vertical {
+  background: transparent;
+  width: 10px;
+  margin: 0;
+}
+
+QScrollBar::handle:vertical {
+  background: #3a3d44;
+  border-radius: 5px;
+  min-height: 24px;
+}
+
+QScrollBar::handle:vertical:hover {
+  background: #4a4e57;
+}
+
+QScrollBar:horizontal {
+  background: transparent;
+  height: 10px;
+  margin: 0;
+}
+
+QScrollBar::handle:horizontal {
+  background: #3a3d44;
+  border-radius: 5px;
+  min-width: 24px;
+}
+
+QScrollBar::handle:horizontal:hover {
+  background: #4a4e57;
+}
+
+QScrollBar::add-line,
+QScrollBar::sub-line {
+  height: 0;
+  width: 0;
+  background: none;
+  border: none;
+}
+
+QScrollBar::add-page,
+QScrollBar::sub-page {
+  background: transparent;
+}
+
+/* ---- Tooltips / menus ---- */
+QToolTip {
+  background: #2d2f34;
+  color: #e4e6eb;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+QMenu {
+  background: #26282d;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  color: #e4e6eb;
+  padding: 4px;
+}
+
+QMenu::item {
+  padding: 6px 18px;
+  border-radius: 6px;
+}
+
+QMenu::item:selected {
+  background: #243a5e;
+  color: #e4e6eb;
+}
+
+QMenu::separator {
+  height: 1px;
+  background: #3a3d44;
+  margin: 4px 8px;
+}

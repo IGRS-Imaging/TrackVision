@@ -1,0 +1,13 @@
+<PlusConfig
+  LogLevel="3"
+  DeviceSetConfigurationDirectory="./config"
+  ImageDirectory="./data"
+  ModelDirectory="./config"
+  ScriptsDirectory="./scripts"
+  OutputDirectory="./data"
+  EditorApplicationExecutable="notepad.exe"
+  LastDeviceSetConfigurationFileName=""
+  CurrentTab="0"
+  HideOnStartup="False"
+  ShowNotifications="True"
+  MinimizeOnClose="False" />
