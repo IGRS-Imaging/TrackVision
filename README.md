@@ -22,44 +22,51 @@ Minimally Invasive Spine Surgery (MISS) procedures — pedicle screw placement, 
 
 ## Architecture
 
-<!-- Architecture Image 1 -->
+### Schematic
+
 <p align="center">
   <img width="1600" height="789" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM (2)" src="https://github.com/user-attachments/assets/e234eeec-5504-4527-9745-5830a6a05d44" />
-
 </p>
 This diagram presents the end-to-end TrackVision pipeline, from optical hardware tracking through data acquisition and transform composition to final multi-planar rendering. It illustrates how live 6-DOF pose streams from the Atracsys FusionTrack camera are relayed via PlusServer and OpenIGTLink into the transform engine. The color-coded blocks distinguish live tracker components, static pre-operative inputs, and protocol layers, giving a high-level view of the full navigation stack.
 
+### 2D-2D Architecture
 
 <p align="center">
   <img width="1600" height="1146" alt="WhatsApp Image 2026-07-15 at 1 38 03 PM" src="https://github.com/user-attachments/assets/76e819be-ff6e-41d0-aaa2-42bc4c397fec" />
 </p>
-
 This schematic outlines the SpineLite 2D–2D Transform Composition Engine used for fluoroscopy-based navigation. Live tooltip and PRM transforms are combined with static AP/LP projection matrices (P_AP, P_LP) to compute the instrument tooltip's pixel coordinates on each X-ray view. The output panel shows the resulting AP and LP overlay images with real-time crosshair projection of the tracked instrument.
+
+### 2D-3D Architecture
 
 <p align="center">
   <img width="1600" height="1171" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM" src="https://github.com/user-attachments/assets/4e08bbab-1041-4b10-afc3-bc0dd545600d" />
-
 </p>
-
-This schematic details the SpineLite 2D–3D Transform Composition Engine, tracing the pipeline from hardware tracking and OpenIGTLink data acquisition through to multi-planar CT rendering. It shows how live TooltipToCamera and PRMToCamera transforms combine with the static ReferenceToCT registration matrix to compute a smoothed PointerToCT pose. The right-hand panel shows the resulting output: synchronized axial/sagittal CT slices and a 3D volumetric render driven by this composed transform.
----
+This schematic details the TrackVision 2D–3D Transform Composition Engine, tracing the pipeline from hardware tracking and OpenIGTLink data acquisition through to multi-planar CT rendering. It shows how live TooltipToCamera and PRMToCamera transforms combine with the static ReferenceToCT registration matrix to compute a smoothed PointerToCT pose. The right-hand panel shows the resulting output: synchronized axial/sagittal CT slices and a 3D volumetric render driven by this composed transform.
 
 ## Results
+
+### 2D-2D Overlay
 
 <p align="center">
   <img width="1518" height="1036" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM (1)" src="https://github.com/user-attachments/assets/66a772ce-c30d-4e2c-bff3-1a19ac91b6c5" />
 </p>
 This screenshot shows the 2D/2D Registration interface with side-by-side AP and LP fluoroscopy views of the lumbar spine. A blue line marks the live tracked instrument trajectory, while the dashed yellow line indicates the planned/reference trajectory for comparison. This overlay allows the surgeon to visually confirm instrument alignment against the pre-planned path in real time during fluoroscopic guidance.
 
+### 2D-3D Per-Vertebra Rendering
+
 <p align="center">
 <img width="1600" height="1104" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM" src="https://github.com/user-attachments/assets/e6ed9e15-1caa-4570-a528-40a67c388a60" />
 </p>
 This panel shows the live 3D needle mesh rendered at its instantaneous tooltip-to-CT pose for each individual lumbar vertebra, L1 through L5. Each sub-view uses standard anatomical orientation labels (A/P, S/I, R) to orient the surgeon within the CT volume. The consistent blue trajectory line across all five vertebrae demonstrates stable tracking accuracy throughout the full lumbar range.
 
+### Simultaneous Tracking of 2D-2D and 2D-3D with TCP/IP
+
 <p align="center">
 <img width="1448" height="1086" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM (1)" src="https://github.com/user-attachments/assets/c6fba5a2-1a19-4fde-b7de-203d0c04182c" />
 </p>
 This image demonstrates TrackVision's TCP/IP multi-screen output feature, where the live navigation view is streamed from the primary laptop to a secondary external display over a local network connection. Both screens mirror the same 2D–3D CT navigation panel, showing synchronized axial, coronal, and sagittal slice views. This setup enables a secondary viewer — such as a surgeon at the operating table — to monitor navigation independently of the primary workstation.
+
+### Viewing Modes
 
 <p align="center">
 <img width="1600" height="916" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM" src="https://github.com/user-attachments/assets/b3c5fde9-7cd4-4ee9-a92b-dbd782dc3a3c" />
