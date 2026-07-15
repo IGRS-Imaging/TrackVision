@@ -27,27 +27,21 @@ Minimally Invasive Spine Surgery (MISS) procedures — pedicle screw placement, 
   <img width="1600" height="789" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM (2)" src="https://github.com/user-attachments/assets/e234eeec-5504-4527-9745-5830a6a05d44" />
 
 </p>
-
-**Intraoperative Hardware Configuration**
-The Atracsys FusionTrack 500 optical camera simultaneously tracks three passive retro-reflective IR marker sets — the C-arm-mounted calibration drum, the surgical instrument tooltip, and the patient reference marker (PRM). The instrument-to-patient spatial relationship is derived online from these live 6-DOF streams.
+This diagram presents the end-to-end TrackVision pipeline, from optical hardware tracking through data acquisition and transform composition to final multi-planar rendering. It illustrates how live 6-DOF pose streams from the Atracsys FusionTrack camera are relayed via PlusServer and OpenIGTLink into the transform engine. The color-coded blocks distinguish live tracker components, static pre-operative inputs, and protocol layers, giving a high-level view of the full navigation stack.
 
 
 <p align="center">
   <img width="1600" height="1146" alt="WhatsApp Image 2026-07-15 at 1 38 03 PM" src="https://github.com/user-attachments/assets/76e819be-ff6e-41d0-aaa2-42bc4c397fec" />
 </p>
 
-**2D–2D Transform Composition Pipeline**
-Live tool and PRM transforms compose to yield the tooltip-to-PRM transform, which is then projected onto pre-acquired AP and LP C-arm fluoroscopy images using static calibrated projection matrices — enabling real-time crosshair updates at 65 Hz with no additional radiation.
+This schematic outlines the SpineLite 2D–2D Transform Composition Engine used for fluoroscopy-based navigation. Live tooltip and PRM transforms are combined with static AP/LP projection matrices (P_AP, P_LP) to compute the instrument tooltip's pixel coordinates on each X-ray view. The output panel shows the resulting AP and LP overlay images with real-time crosshair projection of the tracked instrument.
 
-<!-- Architecture Image 3 -->
 <p align="center">
   <img width="1600" height="1171" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM" src="https://github.com/user-attachments/assets/4e08bbab-1041-4b10-afc3-bc0dd545600d" />
 
 </p>
 
-**2D–3D Transform Composition Pipeline**
-The live instrument tooltip is mapped into the CT volume frame via a static, pre-operatively derived registration matrix, driving multi-planar CT reslicing and a real-time 3D needle mesh render, with pose smoothing applied via an EMA stabiliser.
-
+This schematic details the SpineLite 2D–3D Transform Composition Engine, tracing the pipeline from hardware tracking and OpenIGTLink data acquisition through to multi-planar CT rendering. It shows how live TooltipToCamera and PRMToCamera transforms combine with the static ReferenceToCT registration matrix to compute a smoothed PointerToCT pose. The right-hand panel shows the resulting output: synchronized axial/sagittal CT slices and a 3D volumetric render driven by this composed transform.
 ---
 
 ## Results
@@ -55,31 +49,23 @@ The live instrument tooltip is mapped into the CT volume frame via a static, pre
 <p align="center">
   <img width="1518" height="1036" alt="WhatsApp Image 2026-07-15 at 1 38 06 PM (1)" src="https://github.com/user-attachments/assets/66a772ce-c30d-4e2c-bff3-1a19ac91b6c5" />
 </p>
+This screenshot shows the 2D/2D Registration interface with side-by-side AP and LP fluoroscopy views of the lumbar spine. A blue line marks the live tracked instrument trajectory, while the dashed yellow line indicates the planned/reference trajectory for comparison. This overlay allows the surgeon to visually confirm instrument alignment against the pre-planned path in real time during fluoroscopic guidance.
 
 <p align="center">
 <img width="1600" height="1104" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM" src="https://github.com/user-attachments/assets/e6ed9e15-1caa-4570-a528-40a67c388a60" />
 </p>
+This panel shows the live 3D needle mesh rendered at its instantaneous tooltip-to-CT pose for each individual lumbar vertebra, L1 through L5. Each sub-view uses standard anatomical orientation labels (A/P, S/I, R) to orient the surgeon within the CT volume. The consistent blue trajectory line across all five vertebrae demonstrates stable tracking accuracy throughout the full lumbar range.
 
 <p align="center">
 <img width="1448" height="1086" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM (1)" src="https://github.com/user-attachments/assets/c6fba5a2-1a19-4fde-b7de-203d0c04182c" />
 </p>
+This image demonstrates TrackVision's TCP/IP multi-screen output feature, where the live navigation view is streamed from the primary laptop to a secondary external display over a local network connection. Both screens mirror the same 2D–3D CT navigation panel, showing synchronized axial, coronal, and sagittal slice views. This setup enables a secondary viewer — such as a surgeon at the operating table — to monitor navigation independently of the primary workstation.
 
 <p align="center">
 <img width="1600" height="916" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM" src="https://github.com/user-attachments/assets/b3c5fde9-7cd4-4ee9-a92b-dbd782dc3a3c" />
 </p>
 
-**Tool-Centric Mode**
-CT slice plane is centred on and oriented along the instrument axis, showing a cross-section of the anatomy exactly at the tooltip location and trajectory angle, validated across insertion angles of 25°, 50°, 75°, and 90°.
-
-**Scan-Centric Mode**
-CT slice plane retains the standard anatomical orientation (axial, coronal, or sagittal) while translating to follow the instrument tooltip position, preserving anatomical context as the instrument advances.
-
-**Tool-Dynamic Mode**
-CT slice plane both translates with the instrument tooltip and rotates to remain perpendicular to the instrument axis, offering continuous cross-sectional guidance throughout instrument advancement.
-
-<p align="center">
-  <img src="path/to/results_phantom_validation.png" alt="Phantom Validation Setup" width="700"/>
-</p>
+This grid compares the three VolumeResliceDriver viewing modes — Scan-centric, Tool-centric, and Tool-dynamic — each validated across four instrument insertion angles (25°, 50°, 75°, and 90°). The blue line marks the live instrument trajectory relative to the lumbar vertebral anatomy in each slice. Together, the panels demonstrate how the CT slice plane behaves differently under each mode: staying anatomically fixed, following the tooltip, or rotating to stay perpendicular to the instrument axis.
 
 ### Comparative Performance Analysis
 
