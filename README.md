@@ -120,27 +120,45 @@ TrackVision is compared against Slicer, the closest open-source alternative:
 
 ## Installation
 
-### Getting the software onto the machine
+### Step 1: Obtain the Installer
+Copy the installer file `SpineTracker2-1.0.0-win-amd64.exe` to the target PC.
 
-1. Copy the installer `SpineTracker2-1.0.0-win-amd64.exe` to the PC.
-2. Right-click the installer → **Run as administrator**.
-3. In the NSIS setup wizard, accept the license agreement.
-4. Keep the default install folder `C:\Program Files\Spine Tracker 2.0 1.0.0` (or choose another), then click **Install**.
-5. Click **Finish** — a Start-menu / desktop shortcut `SpineTracker2` is created.
+### Step 2: Run as Administrator
+Right-click the installer and select **Run as administrator**. This is required, as the application installs to `C:\Program Files\`.
 
-> No driver/SDK step needed — the fusionTrack runtime and PlusServer are bundled in the installer.
+### Step 3: Accept the License Agreement
+In the NSIS setup wizard, review and accept the license agreement to proceed.
 
-### Setup (after installation, before use)
+### Step 4: Choose the Install Location
+Keep the default installation folder `C:\Program Files\Spine Tracker 2.0 1.0.0`, or specify an alternate location, then click **Install**.
 
-1. Connect the fusionTrack camera to the PC over Ethernet and power it on.
-2. Confirm the camera is reachable on the network (correct IP / subnet).
-3. Launch `SpineTracker2` from the desktop / Start-menu shortcut.
-4. On startup, the app automatically starts the internal PlusServer, loads the Pointer and Phantom geometry files, and begins streaming tracking transforms (`PointerToPhantom`, `PointerToTracker`, `PhantomToTracker`) on port `18944`.
-5. Verify the status indicators show **PlusServer running** and **tracker connected**.
-6. Proceed to registration / tracking.
+### Step 5: Complete the Installation
+Click **Finish** once installation completes. A Start-menu and desktop shortcut named `SpineTracker2` will be created automatically.
+
+> **Note:** No separate driver or SDK installation is required — the Atracsys fusionTrack runtime and PlusServer are both bundled inside the installer.
+
+### Step 6: Connect the Hardware
+Connect the Atracsys fusionTrack optical camera to the PC via Ethernet and power it on. Confirm the camera is reachable on the network with the correct IP/subnet configuration.
+
+### Step 7: Launch the Application
+Start `SpineTracker2` from the desktop or Start-menu shortcut.
+
+### Step 8: Verify Automatic Initialization
+On launch, the application automatically:
+- Starts the internal PlusServer
+- Loads the Pointer and Phantom calibration geometry files
+- Begins streaming tracking transforms (`PointerToPhantom`, `PointerToTracker`, `PhantomToTracker`) over OpenIGTLink on port `18944`
+
+### Step 9: Confirm System Status
+Check the on-screen status indicators to confirm that **PlusServer is running** and the **tracker is connected**.
+
+### Step 10: Proceed to Registration and Tracking
+Once all status indicators are green, proceed with patient/phantom registration to begin navigation.
 
 ---
 
-<p align="center">
-  <sub>Operational documentation and updates are available on this repository.</sub>
-</p>
+## License
+
+This project is **NOT open source**.
+The source code is published for reference only.
+No permission is granted to copy, modify, distribute, or reuse any part of this project without written permission from the copyright holder.
