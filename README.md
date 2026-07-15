@@ -43,6 +43,8 @@ This schematic outlines the SpineLite 2D–2D Transform Composition Engine used 
 </p>
 This schematic details the TrackVision 2D–3D Transform Composition Engine, tracing the pipeline from hardware tracking and OpenIGTLink data acquisition through to multi-planar CT rendering. It shows how live TooltipToCamera and PRMToCamera transforms combine with the static ReferenceToCT registration matrix to compute a smoothed PointerToCT pose. The right-hand panel shows the resulting output: synchronized axial/sagittal CT slices and a 3D volumetric render driven by this composed transform.
 
+---
+
 ## Results
 
 ### 2D-2D Overlay
