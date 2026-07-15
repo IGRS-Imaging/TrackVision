@@ -156,11 +156,3 @@ Check the on-screen status indicators to confirm that **PlusServer is running** 
 
 ### Step 10: Proceed to Registration and Tracking
 Once all status indicators are green, proceed with patient/phantom registration to begin navigation.
-
----
-
-## License
-
-This project is **NOT open source**.
-The source code is published for reference only.
-No permission is granted to copy, modify, distribute, or reuse any part of this project without written permission from the copyright holder.
