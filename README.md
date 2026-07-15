@@ -1,5 +1,4 @@
 
-
 <h1 align="center">TrackVision: A Modular Open-Source Platform for Real-Time Spine Surgical Navigation</h1>
 
 
@@ -24,7 +23,8 @@ Minimally Invasive Spine Surgery (MISS) procedures — pedicle screw placement, 
 
 <!-- Architecture Image 1 -->
 <p align="center">
-  <img src="path/to/architecture_hardware_setup.png" alt="Intraoperative Hardware Configuration" width="700"/>
+  <img width="1600" height="789" alt="WhatsApp Image 2026-07-15 at 1 38 04 PM (2)" src="https://github.com/user-attachments/assets/e234eeec-5504-4527-9745-5830a6a05d44" />
+
 </p>
 
 **Intraoperative Hardware Configuration**
