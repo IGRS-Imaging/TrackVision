@@ -1,3 +1,5 @@
+
+
 <h1 align="center">TrackVision: A Modular Open-Source Platform for Real-Time Spine Surgical Navigation</h1>
 
 
@@ -5,7 +7,7 @@
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/CMake-064F8C?style=for-the-badge&logo=cmake&logoColor=white" alt="CMake"/>
   <img src="https://img.shields.io/badge/Qt-41CD52?style=for-the-badge&logo=qt&logoColor=white" alt="Qt"/>
-  <img src="https://img.shields.io/badge/OpenIGTLink-005A9C?style=for-the-badge&logo=data:image/png;base64,&logoColor=white" alt="OpenIGTLink"/>
+  <img src="https://img.shields.io/badge/OpenIGTLink-005A9C?style=for-the-badge&logoColor=white" alt="OpenIGTLink"/>
   <img src="https://img.shields.io/badge/PlusServer-orange?style=for-the-badge" alt="PlusServer"/>
   <img src="https://img.shields.io/badge/SlicerCAT-1E90FF?style=for-the-badge" alt="SlicerCAT"/>
 </p>
