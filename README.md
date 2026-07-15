@@ -1,5 +1,5 @@
-<h1 align="center">TrackVision</h1>
-<h3 align="center">A Modular Open-Source Platform for Real-Time Spine Surgical Navigation</h3>
+<h1 align="center">TrackVision: A Modular Open-Source Platform for Real-Time Spine Surgical Navigation</h1>
+
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
