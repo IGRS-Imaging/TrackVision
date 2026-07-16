@@ -76,6 +76,22 @@ This image demonstrates TrackVision's TCP/IP multi-screen output feature, where 
 
 This grid compares the three VolumeResliceDriver viewing modes — Scan-centric, Tool-centric, and Tool-dynamic — each validated across four instrument insertion angles (25°, 50°, 75°, and 90°). The blue line marks the live instrument trajectory relative to the lumbar vertebral anatomy in each slice. Together, the panels demonstrate how the CT slice plane behaves differently under each mode: staying anatomically fixed, following the tooltip, or rotating to stay perpendicular to the instrument axis.
 
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>Tool_Centric</b></td>
+<td align="center"><b>Scan_Centric</b></td>
+<td align="center"><b>Tool_Dynamic</b></td>
+</tr>
+<tr>
+<td><video src="https://github.com/user-attachments/assets/33439f56-d601-4e75-a628-0dbe57fc8839" controls width="380"></video></td>
+<td><video src="https://github.com/user-attachments/assets/03abb5c2-0eae-4310-9800-34d0abd22624" controls width="380"></video></td>
+<td><video src="https://github.com/user-attachments/assets/e62bb3dd-eed2-4112-b66d-50d98e7c2695" controls width="380"></video></td>
+</tr>
+</table>
+</div>
+
+---
 ### Comparative Performance Analysis
 
 TrackVision is compared against Slicer, the closest open-source alternative:
