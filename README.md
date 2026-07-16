@@ -54,6 +54,17 @@ This schematic outlines the SpineLite 2D–2D Transform Composition Engine used 
 </p>
 This schematic details the TrackVision 2D–3D Transform Composition Engine, tracing the pipeline from hardware tracking and OpenIGTLink data acquisition through to multi-planar CT rendering. It shows how live TooltipToCamera and PRMToCamera transforms combine with the static ReferenceToCT registration matrix to compute a smoothed PointerToCT pose. The right-hand panel shows the resulting output: synchronized axial/sagittal CT slices and a 3D volumetric render driven by this composed transform.
 
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>2D-3D Tracking</b></td>
+</tr>
+<tr>
+<td><video src="https://github.com/user-attachments/assets/59c2ec8e-85ac-41d2-9a7e-5faa50f53dca" controls width="380"></video></td>
+</tr>
+</table>
+</div>
+
 ---
 
 ## Results
@@ -78,6 +89,17 @@ This panel shows the live 3D needle mesh rendered at its instantaneous tooltip-t
 <img width="1448" height="1086" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM (1)" src="https://github.com/user-attachments/assets/c6fba5a2-1a19-4fde-b7de-203d0c04182c" />
 </p>
 This image demonstrates TrackVision's TCP/IP multi-screen output feature, where the live navigation view is streamed from the primary laptop to a secondary external display over a local network connection. Both screens mirror the same 2D–3D CT navigation panel, showing synchronized axial, coronal, and sagittal slice views. This setup enables a secondary viewer — such as a surgeon at the operating table — to monitor navigation independently of the primary workstation.
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>Simultaneous Tracking</b></td>
+</tr>
+<tr>
+<td><video src="https://github.com/user-attachments/assets/b7e92ee3-336e-43b5-800d-e30da6551432" controls width="380"></video></td>
+</tr>
+</table>
+</div>
 
 ### Viewing Modes
 
