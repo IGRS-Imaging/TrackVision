@@ -205,3 +205,41 @@ Check the on-screen status indicators to confirm that **PlusServer is running** 
 
 ### Step 10: Proceed to Registration and Tracking
 Once all status indicators are green, proceed with patient/phantom registration to begin navigation.
+
+## Repository Structure
+<details>
+  
+  ```
+  TrackVision/
+├── Media/
+│   ├── Images/
+│   │   ├── 2D-2D_Overlay.png
+│   │   ├── 2d-2d_Architecture.png
+│   │   ├── 2d-3d_Architecture.png
+│   │   ├── IP.jpeg
+│   │   ├── Per-Vertebra_3D_Rendering.png
+│   │   ├── Schematic_Diagram.png
+│   │   ├── Tracking_setup.jpeg
+│   │   └── View_Modes.png
+│   └── Videos/
+│       ├── 2D-2D_Tracking.MOV
+│       ├── 2D-3D_Tracking.MOV
+│       ├── Scan_Centric_Mode.MOV
+│       ├── Simultaneous_Tracking_2D_3D.mp4
+│       ├── Tool_Centric_Mode.MOV
+│       └── Tool_Dynamic_Mode.MOV
+├── Packaged_Interface_Library/
+│   └── TrackVision/
+│       ├── bin/
+│       ├── include/
+│       ├── lib/
+│       ├── libexec/SpineTracker2-5.11/
+│       ├── share/
+│       ├── TrackVision.exe
+│       └── Uninstall.exe
+├── TrackVision_App/
+│   └── TrackVision-1.0.0-win-amd64.exe
+├── .gitattributes
+└── README.md
+  ```
+</details>
