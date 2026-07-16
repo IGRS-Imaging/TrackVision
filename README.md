@@ -36,6 +36,17 @@ This diagram presents the end-to-end TrackVision pipeline, from optical hardware
 </p>
 This schematic outlines the SpineLite 2D–2D Transform Composition Engine used for fluoroscopy-based navigation. Live tooltip and PRM transforms are combined with static AP/LP projection matrices (P_AP, P_LP) to compute the instrument tooltip's pixel coordinates on each X-ray view. The output panel shows the resulting AP and LP overlay images with real-time crosshair projection of the tracked instrument.
 
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>2D-2D Tracking</b></td>
+</tr>
+<tr>
+<td><video src="https://github.com/user-attachments/assets/5881ba07-620c-4182-a97e-6e99429a0353" controls width="380"></video></td>
+</tr>
+</table>
+</div>
+
 ### 2D-3D Architecture
 
 <p align="center">
