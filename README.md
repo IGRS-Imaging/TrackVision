@@ -57,10 +57,10 @@ This schematic details the TrackVision 2D–3D Transform Composition Engine, tra
 <div align="center">
 <table>
 <tr>
-<td align="center"><b>2D-3D Tracking</b></td>
+<td width="580" align="center"><b>2D-3D Tracking</b></td>
 </tr>
 <tr>
-<td><video src="https://github.com/user-attachments/assets/59c2ec8e-85ac-41d2-9a7e-5faa50f53dca" controls width="380"></video></td>
+<td width="580"><video src="https://github.com/user-attachments/assets/59c2ec8e-85ac-41d2-9a7e-5faa50f53dca" controls style="max-widthh:580px;"></video></td>
 </tr>
 </table>
 </div>
@@ -93,10 +93,10 @@ This image demonstrates TrackVision's TCP/IP multi-screen output feature, where 
 <div align="center">
 <table>
 <tr>
-<td align="center"><b>Simultaneous Tracking</b></td>
+<td width="580" align="center"><b>Simultaneous Tracking</b></td>
 </tr>
 <tr>
-<td><video src="https://github.com/user-attachments/assets/b7e92ee3-336e-43b5-800d-e30da6551432" controls width="380"></video></td>
+<td width="580"><video src="https://github.com/user-attachments/assets/b7e92ee3-336e-43b5-800d-e30da6551432" controls style="max-width:580px;"></video></td>
 </tr>
 </table>
 </div>
