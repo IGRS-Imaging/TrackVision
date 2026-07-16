@@ -39,10 +39,10 @@ This schematic outlines the SpineLite 2D–2D Transform Composition Engine used 
 <div align="center">
 <table>
 <tr>
-<td width="380" align="center"><b>2D-2D Tracking</b></td>
+<td width="580" align="center"><b>2D-2D Tracking</b></td>
 </tr>
 <tr>
-<td width="380"><video src="https://github.com/user-attachments/assets/5881ba07-620c-4182-a97e-6e99429a0353" controls style="max-width:380px"></video></td>
+<td width="580"><video src="https://github.com/user-attachments/assets/5881ba07-620c-4182-a97e-6e99429a0353" controls style="max-width:580px"></video></td>
 </tr>
 </table>
 </div>
