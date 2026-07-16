@@ -61,7 +61,7 @@ This screenshot shows the 2D/2D Registration interface with side-by-side AP and 
 </p>
 This panel shows the live 3D needle mesh rendered at its instantaneous tooltip-to-CT pose for each individual lumbar vertebra, L1 through L5. Each sub-view uses standard anatomical orientation labels (A/P, S/I, R) to orient the surgeon within the CT volume. The consistent blue trajectory line across all five vertebrae demonstrates stable tracking accuracy throughout the full lumbar range.
 
-### Simultaneous Tracking of 2D-2D and 2D-3D with TCP/IP
+### Simultaneous Tracking of 2D-3D with TCP/IP
 
 <p align="center">
 <img width="1448" height="1086" alt="WhatsApp Image 2026-07-15 at 1 38 05 PM (1)" src="https://github.com/user-attachments/assets/c6fba5a2-1a19-4fde-b7de-203d0c04182c" />
